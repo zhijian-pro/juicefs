@@ -21,7 +21,6 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -29,6 +28,8 @@ import (
 	"io"
 	"io/ioutil"
 	"strings"
+
+	"github.com/minio/sha256-simd"
 )
 
 type Encryptor interface {

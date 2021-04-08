@@ -67,6 +67,13 @@ func TestRSA(t *testing.T) {
 	}
 }
 
+func BenchmarkSHA256Hash(b *testing.B) {
+	b.SetBytes(4 << 20)
+	for n := 0; n < b.N; n++ {
+		calcSha256Hash(bytes.NewReader(make([]byte, 4<<20)))
+	}
+}
+
 func BenchmarkRSA4096Encrypt(b *testing.B) {
 	secret := make([]byte, 32)
 	kc := NewRSAEncryptor(testkey)

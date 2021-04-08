@@ -34,6 +34,7 @@ require (
 	github.com/minio/cli v1.22.0
 	github.com/minio/minio v0.0.0-20210206053228-97fe57bba92c
 	github.com/minio/minio-go v6.0.14+incompatible
+	github.com/minio/sha256-simd v0.1.1
 	github.com/ncw/swift v1.0.53
 	github.com/pengsrc/go-shared v0.2.0 // indirect
 	github.com/pkg/errors v0.9.1

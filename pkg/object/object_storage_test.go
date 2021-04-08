@@ -220,8 +220,11 @@ func TestS3(t *testing.T) {
 	if os.Getenv("AWS_ACCESS_KEY_ID") == "" {
 		t.SkipNow()
 	}
-	s, _ := newS3(fmt.Sprintf("https://%s", os.Getenv("S3_TEST_BUCKET")),
+	s, err := newS3(fmt.Sprintf("https://%s", os.Getenv("S3_TEST_BUCKET")),
 		os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	testStorage(t, s)
 }
 

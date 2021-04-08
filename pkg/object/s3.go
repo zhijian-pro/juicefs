@@ -17,7 +17,10 @@ package object
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"io/ioutil"
 	"net/url"
@@ -29,9 +32,11 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	// "github.com/minio/sha256-simd"
 )
 
 const awsDefaultRegion = "us-east-1"
+const s3ContentSha256Header = "X-Amz-Content-Sha256"
 
 type s3client struct {
 	bucket string
@@ -99,6 +104,23 @@ func (s *s3client) Get(key string, off, limit int64) (io.ReadCloser, error) {
 	return resp.Body, nil
 }
 
+func calcSha256Hash(body io.ReadSeeker) (string, error) {
+	body.Seek(0, io.SeekStart)
+	defer body.Seek(0, io.SeekStart)
+
+	var sha256Hash hash.Hash = sha256.New()
+	buf := bufPool.Get().(*[]byte)
+	defer bufPool.Put(buf)
+	if _, err := io.CopyBuffer(sha256Hash, body, *buf); err != nil {
+		return "", err
+	}
+
+	encoded := make([]byte, sha256.Size*2)
+	sum := make([]byte, sha256.Size)
+	hex.Encode(encoded, sha256Hash.Sum(sum[0:0]))
+	return string(encoded), nil
+}
+
 func (s *s3client) Put(key string, in io.Reader) error {
 	var body io.ReadSeeker
 	if b, ok := in.(io.ReadSeeker); ok {
@@ -111,14 +133,21 @@ func (s *s3client) Put(key string, in io.Reader) error {
 		body = bytes.NewReader(data)
 	}
 	checksum := generateChecksum(body)
+	sha256Hash, err := calcSha256Hash(body)
+	if err != nil {
+		return fmt.Errorf("Sha256: %s", err)
+	}
+
 	params := &s3.PutObjectInput{
 		Bucket:   &s.bucket,
 		Key:      &key,
 		Body:     body,
 		Metadata: map[string]*string{checksumAlgr: &checksum},
 	}
-	_, err := s.s3.PutObject(params)
-	return err
+	req, _ := s.s3.PutObjectRequest(params)
+	// speedup sha256 hash
+	req.HTTPRequest.Header[s3ContentSha256Header] = []string{sha256Hash + "abc"}
+	return req.Send()
 }
 
 func (s *s3client) Copy(dst, src string) error {

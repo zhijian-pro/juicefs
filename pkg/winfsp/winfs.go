@@ -53,6 +53,7 @@ type juice struct {
 	badfd    map[uint64]uint64
 
 	asRoot     bool
+	ignoreUID  bool
 	delayClose int
 }
 
@@ -294,14 +295,19 @@ func (j *juice) OpenEx(path string, fi *fuse.FileInfo_t) (e int) {
 	return
 }
 
-func attrToStat(inode Ino, attr *meta.Attr, stat *fuse.Stat_t) {
+func (j *juice) attrToStat(ctx vfs.LogContext, ctx inode Ino, attr *meta.Attr, stat *fuse.Stat_t) {
 	stat.Ino = uint64(inode)
 	stat.Mode = attr.SMode()
-	stat.Uid = attr.Uid
+	if j.ignoreUID {
+		stat.Uid = ctx.Uid()
+		stat.Gid = ctx.Gid()
+	} else {
+		stat.Uid = attr.Uid
+		stat.Gid = attr.Gid
+	}
 	if stat.Uid == 0 {
 		stat.Uid = 18 // System
 	}
-	stat.Gid = attr.Gid
 	if stat.Gid == 0 {
 		stat.Gid = 18 // System
 	}
@@ -381,7 +387,7 @@ func (j *juice) Getattr(p string, stat *fuse.Stat_t, fh uint64) (e int) {
 		e = -int(errrno)
 		return
 	}
-	attrToStat(entry.Inode, entry.Attr, stat)
+	j.attrToStat(ctx, entry.Inode, entry.Attr, stat)
 	return
 }
 
@@ -538,7 +544,7 @@ func (j *juice) Readdir(path string,
 		name := string(e.Name)
 		if full {
 			vfs.UpdateLength(e.Inode, e.Attr)
-			attrToStat(e.Inode, e.Attr, &st)
+			j.attrToStat(ctx, e.Inode, e.Attr, &st)
 			ok = fill(name, &st, 0)
 		} else {
 			ok = fill(name, nil, 0)
@@ -565,16 +571,17 @@ func (j *juice) Releasedir(path string, fh uint64) (e int) {
 	return
 }
 
-func Serve(conf *vfs.Config, fs_ *fs.FileSystem, fuseOpt string, fileCacheTo float64, asRoot bool, delayClose int, caseInsensi bool) error {
+func Serve(conf *vfs.Config, fs_ *fs.FileSystem, fuseOpt string, fileCacheTo float64, asRoot bool, delayClose int, caseInsensi bool, ignoreUID bool) error {
 	var jfs juice
 	jfs.conf = conf
 	jfs.fs = fs_
 	jfs.asRoot = asRoot
 	jfs.delayClose = delayClose
+	jfs.ignoreUID = ignoreUID
 	host := fuse.NewFileSystemHost(&jfs)
 	jfs.host = host
 	var options = "volname=" + conf.Format.Name
-	options += ",ExactFileSystemName=JuiceFS,create_umask=022,ThreadCount=16"
+	options += ",ExactFileSystemName=JuiceFS,create_umask=000,ThreadCount=16"
 	options += ",DirInfoTimeout=1000,VolumeInfoTimeout=1000,KeepFileCache"
 	options += fmt.Sprintf(",FileInfoTimeout=%d", int(fileCacheTo*1000))
 	options += ",VolumePrefix=/juicefs/" + conf.Format.Name

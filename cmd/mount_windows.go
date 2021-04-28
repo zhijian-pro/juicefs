@@ -36,6 +36,10 @@ func mount_flags() []cli.Flag {
 			Name:  "as-root",
 			Usage: "Access files as administrator",
 		},
+		&cli.BoolFlag{
+			Name:  "ignore-uid",
+			Usage: "Access files as administrator",
+		},
 		&cli.Float64Flag{
 			Name:  "file-cache-to",
 			Value: 0.1,

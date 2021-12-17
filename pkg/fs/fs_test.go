@@ -17,6 +17,7 @@ package fs
 
 import (
 	"io"
+	"syscall"
 	"testing"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
@@ -75,5 +76,25 @@ func TestFileSystem(t *testing.T) {
 	}
 	if err := fs.Delete(ctx, "/hello"); err != 0 {
 		t.Fatalf("delete /hello: %s", err)
+	}
+
+	// path with trailing /
+	if err := fs.Mkdir(ctx, "/ddd/", 0777); err != 0 {
+		t.Fatalf("mkdir /ddd/: %s", err)
+	}
+	if _, err := fs.Create(ctx, "/ddd/ddd", 0777); err != 0 {
+		t.Fatalf("create /ddd/ddd: %s", err)
+	}
+	if _, err := fs.Create(ctx, "/ddd/fff/", 0777); err != syscall.EINVAL {
+		t.Fatalf("create /ddd/fff/: %s", err)
+	}
+	if err := fs.Delete(ctx, "/ddd/"); err != syscall.ENOTEMPTY {
+		t.Fatalf("delete /ddd/: %s", err)
+	}
+	if err := fs.Rmr(ctx, "/ddd/"); err != 0 {
+		t.Fatalf("rmr /ddd/: %s", err)
+	}
+	if _, err := fs.Stat(ctx, "/ddd/"); err != syscall.ENOENT {
+		t.Fatalf("stat /ddd/: %s", err)
 	}
 }

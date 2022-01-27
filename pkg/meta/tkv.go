@@ -401,6 +401,7 @@ func (m *kvMeta) Load() (*Format, error) {
 }
 
 func (m *kvMeta) NewSession() error {
+	start := time.Now()
 	go m.refreshUsage()
 	if m.conf.ReadOnly {
 		return nil
@@ -409,10 +410,12 @@ func (m *kvMeta) NewSession() error {
 	if err != nil {
 		return fmt.Errorf("create session: %s", err)
 	}
+	logger.Infof("TRACE: sid %d stage 1: got session id costs %v", v, time.Since(start))
 	m.sid = uint64(v)
 	logger.Debugf("session is %d", m.sid)
 	_ = m.setValue(m.sessionKey(m.sid), m.packInt64(time.Now().Unix()))
 	info := newSessionInfo()
+	logger.Infof("TRACE: sid %d stage 2: got session info costs %v", v, time.Since(start))
 	info.MountPoint = m.conf.MountPoint
 	data, err := json.Marshal(info)
 	if err != nil {
@@ -421,12 +424,14 @@ func (m *kvMeta) NewSession() error {
 	if err = m.setValue(m.sessionInfoKey(m.sid), data); err != nil {
 		return fmt.Errorf("set session info: %s", err)
 	}
+	logger.Infof("TRACE: sid %d stage 3: set session info cost: %v", v, time.Since(start))
 
 	go m.refreshSession()
 	go m.cleanupDeletedFiles()
 	go m.cleanupSlices()
 	go m.cleanupTrash()
 	go m.flushStats()
+	logger.Infof("TRACE: sid %d stage 4: before return cost: %v", v, time.Since(start))
 	return nil
 }
 

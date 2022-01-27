@@ -35,13 +35,13 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
-func checkMountpoint(name, mp string) {
-	for i := 0; i < 20; i++ {
-		time.Sleep(time.Millisecond * 500)
+func checkMountpoint(name, mp string, start time.Time) {
+	for i := 0; i < 200; i++ {
+		time.Sleep(time.Millisecond * 50)
 		st, err := os.Stat(mp)
 		if err == nil {
 			if sys, ok := st.Sys().(*syscall.Stat_t); ok && sys.Ino == 1 {
-				logger.Infof("\033[92mOK\033[0m, %s is ready at %s", name, mp)
+				logger.Infof("\033[92mOK\033[0m, %s is ready at %s after %v", name, mp, time.Since(start))
 				return
 			}
 		}
@@ -58,7 +58,7 @@ func makeDaemon(c *cli.Context, name, mp string) error {
 		if stage != 0 {
 			return nil
 		}
-		checkMountpoint(name, mp)
+		checkMountpoint(name, mp, time.Now())
 		return nil
 	}
 
@@ -167,7 +167,7 @@ func disableUpdatedb() {
 	}
 }
 
-func mount_main(v *vfs.VFS, c *cli.Context) {
+func mount_main(v *vfs.VFS, c *cli.Context, start time.Time) {
 	if os.Getuid() == 0 && os.Getpid() != 1 {
 		disableUpdatedb()
 	}
@@ -176,7 +176,7 @@ func mount_main(v *vfs.VFS, c *cli.Context) {
 	conf.AttrTimeout = time.Millisecond * time.Duration(c.Float64("attr-cache")*1000)
 	conf.EntryTimeout = time.Millisecond * time.Duration(c.Float64("entry-cache")*1000)
 	conf.DirEntryTimeout = time.Millisecond * time.Duration(c.Float64("dir-entry-cache")*1000)
-	logger.Infof("Mounting volume %s at %s ...", conf.Format.Name, conf.Mountpoint)
+	logger.Infof("Mounting volume %s at %s ... %v", conf.Format.Name, conf.Mountpoint, time.Since(start))
 	err := fuse.Serve(v, c.String("o"), c.Bool("enable-xattr"))
 	if err != nil {
 		logger.Fatalf("fuse: %s", err)

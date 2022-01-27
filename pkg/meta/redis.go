@@ -237,6 +237,7 @@ func (r *redisMeta) Load() (*Format, error) {
 }
 
 func (r *redisMeta) NewSession() error {
+	start := time.Now()
 	go r.refreshUsage()
 	if r.conf.ReadOnly {
 		return nil
@@ -245,16 +246,19 @@ func (r *redisMeta) NewSession() error {
 	if err != nil {
 		return fmt.Errorf("create session: %s", err)
 	}
+	logger.Infof("TRACE: sid %d stage 1: got session id costs %v", sid, time.Since(start))
 	r.sid = uint64(sid)
 	logger.Debugf("session is %d", r.sid)
 	r.rdb.ZAdd(Background, allSessions, &redis.Z{Score: float64(time.Now().Unix()), Member: strconv.Itoa(int(r.sid))})
 	info := newSessionInfo()
+	logger.Infof("TRACE: sid %d stage 2: got session info costs %v", sid, time.Since(start))
 	info.MountPoint = r.conf.MountPoint
 	data, err := json.Marshal(info)
 	if err != nil {
 		return fmt.Errorf("json: %s", err)
 	}
 	r.rdb.HSet(Background, sessionInfos, r.sid, data)
+	logger.Infof("TRACE: sid %d stage 3: set session info cost: %v", sid, time.Since(start))
 
 	r.shaLookup, err = r.rdb.ScriptLoad(Background, scriptLookup).Result()
 	if err != nil {
@@ -271,6 +275,7 @@ func (r *redisMeta) NewSession() error {
 	go r.cleanupDeletedFiles()
 	go r.cleanupSlices()
 	go r.cleanupTrash()
+	logger.Infof("TRACE: sid %d stage 4: before return cost: %v", sid, time.Since(start))
 	return nil
 }
 

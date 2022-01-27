@@ -49,9 +49,9 @@ func makeDaemon(c *cli.Context, name, mp string) error {
 	return nil
 }
 
-func mount_main(v *vfs.VFS, c *cli.Context) {
+func mount_main(v *vfs.VFS, c *cli.Context, start time.Time) {
 	winfsp.Serve(v, c.String("o"), c.Float64("file-cache-to"), c.Bool("as-root"), c.Int("delay-close"))
 }
 
-func checkMountpoint(name, mp string) {
+func checkMountpoint(name, mp string, start time.Time) {
 }

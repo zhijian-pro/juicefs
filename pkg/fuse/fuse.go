@@ -415,6 +415,7 @@ func (fs *fileSystem) StatFs(cancel <-chan struct{}, in *fuse.InHeader, out *fus
 
 // Serve starts a server to serve requests from FUSE.
 func Serve(v *vfs.VFS, options string, xattrs bool) error {
+	start := time.Now()
 	if err := syscall.Setpriority(syscall.PRIO_PROCESS, os.Getpid(), -19); err != nil {
 		logger.Warnf("setpriority: %s", err)
 	}
@@ -457,6 +458,7 @@ func Serve(v *vfs.VFS, options string, xattrs bool) error {
 		return fmt.Errorf("fuse: %s", err)
 	}
 
+	logger.Infof("TRACE: fuse before serve cost: %v", time.Since(start))
 	fssrv.Serve()
 	return nil
 }

@@ -240,6 +240,7 @@ func mount(c *cli.Context) error {
 		Chunk:      &chunkConf,
 	}
 
+	start := time.Now()
 	if c.Bool("background") && os.Getenv("JFS_FOREGROUND") == "" {
 		if runtime.GOOS != "windows" {
 			d := c.String("cache-dir")
@@ -275,7 +276,7 @@ func mount(c *cli.Context) error {
 			logger.Fatalf("Failed to make daemon: %s", err)
 		}
 	} else {
-		go checkMountpoint(conf.Format.Name, mp)
+		go checkMountpoint(conf.Format.Name, mp, start)
 	}
 
 	err = m.NewSession()
@@ -284,17 +285,19 @@ func mount(c *cli.Context) error {
 	}
 	installHandler(mp)
 	v := vfs.NewVFS(conf, m, store)
+	logger.Infof("TRACE: after new vfs cost: %v", time.Since(start))
 	metricsAddr := exposeMetrics(m, c)
 	if c.IsSet("consul") {
 		metric.RegisterToConsul(c.String("consul"), metricsAddr, mp)
 	}
+	logger.Infof("TRACE: after register consul cost: %v", time.Since(start))
 	if d := c.Duration("backup-meta"); d > 0 {
 		go vfs.Backup(m, blob, d)
 	}
 	if !c.Bool("no-usage-report") {
 		go usage.ReportUsage(m, version.Version())
 	}
-	mount_main(v, c)
+	mount_main(v, c, start)
 	return m.CloseSession()
 }
 

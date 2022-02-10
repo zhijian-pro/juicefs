@@ -23,13 +23,13 @@ Although it is easy and convenient to set the database password directly in the 
 Environment variable names can be freely defined, e.g.
 
 ```shell
-export $PG_PASSWD=mypassword
+export META_PASSWORD=mypassword
 ```
 
 Passing the database password in the metadata URL via environment variables.
 
 ```shell
-juicefs mount -d "postgres://user:$PG_PASSWD@192.168.1.6:5432/juicefs" /mnt/jfs
+juicefs mount -d "postgres://user:@192.168.1.6:5432/juicefs" /mnt/jfs
 ```
 
 ## Backup periodically
@@ -37,10 +37,6 @@ juicefs mount -d "postgres://user:$PG_PASSWD@192.168.1.6:5432/juicefs" /mnt/jfs
 Please refer to the official manual [Chapter 26. Backup and Restore](https://www.postgresql.org/docs/current/backup.html) to learn how to backup and restore the database.
 
 It is recommended to make a database backup plan and follow it periodically, and at the same time, try to restore the data in an experimental environment to confirm that the backup is valid.
-
-## Using connection pooling
-
-Connection pooling is an intermediate layer between the client and the database, which acts as an intermediary to improve connection efficiency and reduce the loss of short connections. Commonly used connection pools are [PgBouncer](https://www.pgbouncer.org/) and [Pgpool-II](https://www.pgpool.net/).
 
 ## High Availability
 

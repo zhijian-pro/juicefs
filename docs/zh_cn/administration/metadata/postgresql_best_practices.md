@@ -23,13 +23,13 @@ sidebar_position: 2
 环境变量名称可以自由定义，例如：
 
 ```shell
-export $PG_PASSWD=mypassword
+export META_PASSWORD=mypassword
 ```
 
 在元数据 URL 中通过环境变量传递数据库密码：
 
 ```shell
-juicefs mount -d "postgres://user:$PG_PASSWD@192.168.1.6:5432/juicefs" /mnt/jfs
+juicefs mount -d "postgres://user:@192.168.1.6:5432/juicefs" /mnt/jfs
 ```
 
 ## 定期备份
@@ -37,10 +37,6 @@ juicefs mount -d "postgres://user:$PG_PASSWD@192.168.1.6:5432/juicefs" /mnt/jfs
 请参考官方手册 [Chapter 26. Backup and Restore](https://www.postgresql.org/docs/current/backup.html) 了解如何备份和恢复数据库。
 
 建议制定数据库备份计划，并遵照计划定期备份 PostgreSQL 数据库，与此同时，还应该在实验环境中尝试恢复数据，确认备份是有效的。
-
-## 使用连接池
-
-连接池是客户端与数据库之间的中间层，由它作为中介提升连接效率，降低短连接的损耗。常用的连接池有 [PgBouncer](https://www.pgbouncer.org/) 和 [Pgpool-II](https://www.pgpool.net/) 。
 
 ## 高可用
 

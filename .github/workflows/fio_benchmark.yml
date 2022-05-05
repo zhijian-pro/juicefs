@@ -136,7 +136,7 @@ jobs:
                 fi
                 fio --name=$name --directory=${{ steps.vars.outputs.MOUNT_POINT }} $fio_arg > result.log
                 bw=$(tail -1 result.log | awk '{print $2}' | awk -F '=' '{print $2}' | sed 's/.iB.*//g')
-                bw_list+=$bw
+                bw_list+=($bw)
                 echo $bw, $(date +"%Y-%m-%d %H:%M:%S"), ${{github.sha}}, https://github.com/${{github.repository}}/actions/runs/${{github.run_id}}, $juicefs_version, $name, ${{ github.ref_name }}, $default_size, redis, minio | tee -a $csv_file
                 
                 ./$bin_name umount -f ${{ steps.vars.outputs.MOUNT_POINT }}

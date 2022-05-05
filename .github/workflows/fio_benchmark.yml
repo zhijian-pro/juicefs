@@ -155,7 +155,7 @@ jobs:
             fi
           done
           mysql -h 172.27.0.1 -u root -p${{secrets.MYSQL_PASSWORD}} -e "use  test_result; LOAD DATA INFILE '/var/lib/mysql-files/result.csv' INTO TABLE fio_test FIELDS TERMINATED BY ',' (bandwidth, created_date, github_revision, workflow_url, juicefs_version, name, ref_name, size, meta_engine, storage); " 
-          if [ $fail ]; then
+          if $fail; then
             echo "Fatal: fio bandwidth decreased by 20% compared with last version, please check the result file"
             exit 1
           fi

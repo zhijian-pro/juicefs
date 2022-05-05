@@ -20,7 +20,7 @@ jobs:
         run: |
           echo ::set-output name=META_URL::redis://mymaster,172.27.0.1,172.27.0.2,172.27.0.3:26379/6
           echo ::set-output name=MOUNT_POINT::/tmp/juicefs-fio-benchmark
-          echo ::set-output name=BACKWARD_VERSIONS::2
+          echo ::set-output name=BACKWARD_VERSIONS::1
 
       - name: Build linux target
         run: |
@@ -101,8 +101,10 @@ jobs:
               rm jfs -rf
             fi
           done
+          fail=false
           for job in "${fio_jobs[@]}"; do
             echo job is:: $job
+            bw_list=()
             for url in "${urls[@]}"; do
               echo url is: $url
               bin_name=$(echo $(basename $url) | sed 's/.tar.gz//g') 
@@ -134,6 +136,7 @@ jobs:
                 fi
                 fio --name=$name --directory=${{ steps.vars.outputs.MOUNT_POINT }} $fio_arg > result.log
                 bw=$(tail -1 result.log | awk '{print $2}' | awk -F '=' '{print $2}' | sed 's/.iB.*//g')
+                bw_list+=$bw
                 echo $bw, $(date +"%Y-%m-%d %H:%M:%S"), ${{github.sha}}, https://github.com/${{github.repository}}/actions/runs/${{github.run_id}}, $juicefs_version, $name, ${{ github.ref_name }}, $default_size, redis, minio | tee -a $csv_file
                 
                 ./$bin_name umount -f ${{ steps.vars.outputs.MOUNT_POINT }}
@@ -144,10 +147,28 @@ jobs:
                 mc rb  myminio/$name --force --dangerous || printf "Warining; remove bucket failed: %s, exit code: %s" "myminio/$name" "$?"
               fi
             done
+            new=${bw_list[0]}
+            old=$(expr ${bw_list[1]}*0.8 | bc)
+            if (( $(echo "$new < $old" |bc -l) )); then
+              printf "Fatal: bandwidth decreased too much: new is: %s, old is: %s" ${bw_list[0]} ${bw_list[1]} 
+              fail=true
+            fi
           done
           mysql -h 172.27.0.1 -u root -p${{secrets.MYSQL_PASSWORD}} -e "use  test_result; LOAD DATA INFILE '/var/lib/mysql-files/result.csv' INTO TABLE fio_test FIELDS TERMINATED BY ',' (bandwidth, created_date, github_revision, workflow_url, juicefs_version, name, ref_name, size, meta_engine, storage); " 
+          if [ $fail ]; then
+            echo "Fatal: fio bandwidth decreased by 20% compared with last version, please check the result file"
+            exit 1
+          fi
+
+      - name: Save test reuslt
+        if: ${{always()}}
+        uses: actions/upload-artifact@v2
+        with: 
+          name: result.csv
+          path: /var/lib/mysql-files/result.csv
 
       - name: Clean After
+        if: ${{always()}}
         run: |
           if [ -d ${{ steps.vars.outputs.MOUNT_POINT }} ]; then
             ./juicefs umount ${{ steps.vars.outputs.MOUNT_POINT }} || true

@@ -89,20 +89,22 @@ jobs:
           test -f $csv_file  && rm $csv_file -f
           urls=("juicefs")
           urls+=($(curl -s https://api.github.com/repos/juicedata/juicefs/releases | grep browser_download_url | grep linux-amd64.tar.gz | awk -F\" '{print $4}' | head -${{ steps.vars.outputs.BACKWARD_VERSIONS }}))          
-          for job in "${fio_jobs[@]}"; do
-            bin_name=juicefs
+          for url in "${urls[@]}"; do
             if [[ $url == http* ]]; then  
               echo download url is: $url
               wget -q $url
-              bin_name=echo $(basename $url) | sed 's/.tar.gz//g' 
+              bin_name=$(echo $(basename $url) | sed 's/.tar.gz//g')
               tar -zxf $(basename $url) $bin_name
               rm $(basename $url)
             fi
-            juicefs_version=$(./$bin_name -V|cut -b 17-)
-            echo juicefs version: $(./$bin_name -V)
+          done
+          for job in "${fio_jobs[@]}"; do
+            echo job is:: $job
             for url in "${urls[@]}"; do
-              bin_name=echo $(basename $url) | sed 's/.tar.gz//g' 
-              echo job is:, $job
+              echo url is: $url
+              bin_name=$(echo $(basename $url) | sed 's/.tar.gz//g') 
+              juicefs_version=$(./$bin_name -V|cut -b 17-)
+              echo juicefs version: $(./$bin_name -V)
               if [ -n "$job" ]; then
                 name=$(echo $job | awk -F: '{print $1}' | xargs)
                 fio_arg=$(echo $job | awk -F: '{print $2}' | xargs)

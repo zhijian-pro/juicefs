@@ -149,8 +149,9 @@ jobs:
             done
             new=${bw_list[0]}
             old=$(expr ${bw_list[1]}*0.8 | bc)
+            echo new is $new, old is $old
             if (( $(echo "$new < $old" |bc -l) )); then
-              printf "Fatal: bandwidth decreased too much: new is: %s, old is: %s" ${bw_list[0]} ${bw_list[1]} 
+              printf "Fatal: bandwidth decreased too much: new is: %s, old is: %s\n" ${bw_list[0]} ${bw_list[1]} 
               fail=true
             fi
           done

@@ -94,8 +94,11 @@ jobs:
               echo download url is: $url
               wget -q $url
               bin_name=$(echo $(basename $url) | sed 's/.tar.gz//g')
-              tar -zxf $(basename $url) $bin_name
+              mkdir jfs || true
+              tar -zxf $(basename $url) -C jfs
+              mv jfs/juicefs $bin_name
               rm $(basename $url)
+              rm jfs -rf
             fi
           done
           for job in "${fio_jobs[@]}"; do

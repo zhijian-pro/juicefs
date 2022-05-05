@@ -41,7 +41,7 @@ jobs:
 
       - name: Fio Benchmark 
         run: |
-          default_size=10M
+          default_size=1G
           warning_value=90
           fio_jobs=(
             "big-file-sequential-read:      --rw=read --refill_buffers --bs=256k --size=${default_size}" \
@@ -148,12 +148,11 @@ jobs:
               fi
             done
             new=${bw_list[0]}
-            old=$(expr ${bw_list[1]}*1.2 | bc)
+            old=$(expr ${bw_list[1]}*0.8 | bc)
             echo new is $new, old is $old
             if (( $(echo "$new < $old" |bc -l) )); then
               printf "Fatal: bandwidth decreased too much: new is: %s, old is: %s\n" ${bw_list[0]} ${bw_list[1]} 
               fail=true
-              exit 1
             fi
           done
           mysql -h 172.27.0.1 -u root -p${{secrets.MYSQL_PASSWORD}} -e "use  test_result; LOAD DATA INFILE '/var/lib/mysql-files/result.csv' INTO TABLE fio_test FIELDS TERMINATED BY ',' (bandwidth, created_date, github_revision, workflow_url, juicefs_version, name, ref_name, size, meta_engine, storage); " 

@@ -90,6 +90,7 @@ jobs:
           urls=("juicefs")
           urls+=($(curl -s https://api.github.com/repos/juicedata/juicefs/releases | grep browser_download_url | grep linux-amd64.tar.gz | awk -F\" '{print $4}' | head -${{ steps.vars.outputs.BACKWARD_VERSIONS }}))          
           for job in "${fio_jobs[@]}"; do
+            bin_name=juicefs
             if [[ $url == http* ]]; then  
               echo download url is: $url
               wget -q $url

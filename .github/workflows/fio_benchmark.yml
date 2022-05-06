@@ -107,6 +107,10 @@ jobs:
             echo job is:: $job
             bw_list=()
             for url in "${urls[@]}"; do
+              rev=$(./$bin_name -V | awk -F- '{print $1}' | awk -F ' ' '{print $3}')
+              if [[ "$rev" < "1.0.0" ]]; then
+                continue
+              fi
               echo url is: $url
               bin_name=$(echo $(basename $url) | sed 's/.tar.gz//g') 
               juicefs_version=$(./$bin_name -V|cut -b 17-)
@@ -127,13 +131,7 @@ jobs:
                     break
                   fi
                 done
-                rev=$(./$bin_name -V | awk -F- '{print $1}' | awk -F ' ' '{print $3}')
-                if [[ "$rev" < "1.0.0" ]]; then
-                  trash_day=""
-                else
-                  trash_day="--trash-days 0"
-                fi
-                ./$bin_name format $trash_day --storage minio --bucket  $minio_url --access-key minioadmin --secret-key ${{ secrets.MINIO_SECRET_KEY }}  ${{ steps.vars.outputs.META_URL }} fio-benchmark
+                ./$bin_name format --trash-days 0 --storage minio --bucket  $minio_url --access-key minioadmin --secret-key ${{ secrets.MINIO_SECRET_KEY }}  ${{ steps.vars.outputs.META_URL }} fio-benchmark
                 ./$bin_name mount -d ${{ steps.vars.outputs.META_URL }} ${{ steps.vars.outputs.MOUNT_POINT }} --no-usage-report $mount_arg &
                 if [[ "$name" =~ ^big-file-rand-read.* ]]; then
                   block_size=$(echo $name | awk -F- '{print $NF}' | xargs)

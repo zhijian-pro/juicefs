@@ -41,7 +41,7 @@ jobs:
 
       - name: Fio Benchmark 
         run: |
-          default_size=1G
+          default_size=50M
           warning_value=90
           fio_jobs=(
             "big-file-sequential-read:      --rw=read --refill_buffers --bs=256k --size=${default_size}" \
@@ -144,7 +144,14 @@ jobs:
                 echo "start fio"
                 fio --name=$name --directory=${{ steps.vars.outputs.MOUNT_POINT }} $fio_arg > result.log
                 echo "finish fio"
-                bw=$(tail -1 result.log | awk '{print $2}' | awk -F '=' '{print $2}' | sed 's/.iB.*//g')
+                bw_str=$(tail -1 result.log | awk '{print $2}' | awk -F '=' '{print $2}' )
+                bw=$(echo $bw_str | sed 's/.iB.*//g') 
+                if [[ $bw_str == *KiB* ]]; then
+                  bw=$(echo "scale=2; $bw/1024.0" | bc -l)
+                elif [[ $bw_str == *GiB* ]]; then
+                  bw=$(echo "scale=2; $bw*1024.0" | bc -l)
+                fi
+                
                 bw_list+=($bw)
                 echo $name, $bw, $juicefs_version, $default_size, ${{ github.ref_name }}, $(date +"%Y-%m-%d %H:%M:%S"), ${{github.sha}}, https://github.com/${{github.repository}}/actions/runs/${{github.run_id}},  redis, minio | tee -a $csv_file
               

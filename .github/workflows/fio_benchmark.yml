@@ -20,7 +20,7 @@ jobs:
         run: |
           echo ::set-output name=META_URL::redis://mymaster,172.27.0.1,172.27.0.2,172.27.0.3:26379/6
           echo ::set-output name=MOUNT_POINT::/tmp/juicefs-fio-benchmark
-          echo ::set-output name=BACKWARD_VERSIONS::5
+          echo ::set-output name=BACKWARD_VERSIONS::4
 
       - name: Build linux target
         run: |
@@ -155,8 +155,8 @@ jobs:
               printf "Fatal: bandwidth decreased too much: new is: %s, old is: %s\n" ${bw_list[0]} ${bw_list[1]} 
               fail=true
             fi
-            set +x
           done
+          set +x
           mysql -h 172.27.0.1 -u root -p${{secrets.MYSQL_PASSWORD}} -e "use  test_result; LOAD DATA INFILE '/var/lib/mysql-files/result.csv' INTO TABLE fio_test FIELDS TERMINATED BY ',' (bandwidth, created_date, github_revision, workflow_url, juicefs_version, name, ref_name, size, meta_engine, storage); " 
           if $fail; then
             echo "Fatal: fio bandwidth decreased by 20% compared with last version, please check the result file"

@@ -102,6 +102,7 @@ jobs:
             fi
           done
           fail=false
+          set -x
           for job in "${fio_jobs[@]}"; do
             echo job is:: $job
             bw_list=()
@@ -154,6 +155,7 @@ jobs:
               printf "Fatal: bandwidth decreased too much: new is: %s, old is: %s\n" ${bw_list[0]} ${bw_list[1]} 
               fail=true
             fi
+            set +x
           done
           mysql -h 172.27.0.1 -u root -p${{secrets.MYSQL_PASSWORD}} -e "use  test_result; LOAD DATA INFILE '/var/lib/mysql-files/result.csv' INTO TABLE fio_test FIELDS TERMINATED BY ',' (bandwidth, created_date, github_revision, workflow_url, juicefs_version, name, ref_name, size, meta_engine, storage); " 
           if $fail; then

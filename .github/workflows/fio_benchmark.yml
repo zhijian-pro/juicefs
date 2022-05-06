@@ -141,7 +141,9 @@ jobs:
                   fio --name=big-file-rand-read-preload --directory=${{ steps.vars.outputs.MOUNT_POINT }} --rw=randread --refill_buffers --size=${default_size} --filename=randread.bin --bs=$block_size --pre_read=1
                   sudo sync && echo 3 > /proc/sys/vm/drop_caches
                 fi
+                echo "start fio"
                 fio --name=$name --directory=${{ steps.vars.outputs.MOUNT_POINT }} $fio_arg > result.log
+                echo "finish fio"
                 bw=$(tail -1 result.log | awk '{print $2}' | awk -F '=' '{print $2}' | sed 's/.iB.*//g')
                 bw_list+=($bw)
                 echo $bw, $(date +"%Y-%m-%d %H:%M:%S"), ${{github.sha}}, https://github.com/${{github.repository}}/actions/runs/${{github.run_id}}, $juicefs_version, $name, ${{ github.ref_name }}, $default_size, redis, minio | tee -a $csv_file

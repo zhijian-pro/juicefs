@@ -42,7 +42,8 @@ jobs:
       - name: Fio Benchmark 
         run: |
           default_size=50M
-          warning_value=90
+          disk_warning_value=90
+          decrease_ratio=0.8
           fio_jobs=(
             "big-file-sequential-read:      --rw=read --refill_buffers --bs=256k --size=${default_size}" \
             "big-file-sequential-write:     --rw=write --refill_buffers --bs=256k --size=${default_size}" \
@@ -120,7 +121,7 @@ jobs:
                 rm /var/jfsCache/ -rf
                 while true; do
                   used=$(df -h /mnt/minio/data1  | awk 'NR>1 {gsub(/%/,""); print $5}') 
-                  if [ $used -gt $warning_value ]; then
+                  if [ $used -gt $disk_warning_value ]; then
                     printf "disk used %s%%, sleep 10s\n" "$used"
                     sleep 10s
                   else
@@ -164,7 +165,7 @@ jobs:
               fi
             done
             new=${bw_list[0]}
-            old=$(expr ${bw_list[1]}*0.8 | bc)
+            old=$(expr ${bw_list[1]}*$decrease_ratio | bc)
             echo new is $new, old is $old
             if (( $(echo "$new < $old" |bc -l) )); then
               printf "Fatal: bandwidth decreased too much: new is: %s, old is: %s\n" ${bw_list[0]} ${bw_list[1]} 

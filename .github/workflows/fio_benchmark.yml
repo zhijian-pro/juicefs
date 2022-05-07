@@ -20,7 +20,7 @@ jobs:
         run: |
           echo ::set-output name=META_URL::redis://mymaster,172.27.0.1,172.27.0.2,172.27.0.3:26379/6
           echo ::set-output name=MOUNT_POINT::/tmp/juicefs-fio-benchmark
-          echo ::set-output name=BACKWARD_VERSIONS::4
+          echo ::set-output name=BACKWARD_VERSIONS::1
 
       - name: Build linux target
         run: |
@@ -41,7 +41,7 @@ jobs:
 
       - name: Fio Benchmark 
         run: |
-          default_size=1G
+          default_size=10M
           disk_warning_value=90
           decrease_ratio=0.8
           fio_jobs=(
@@ -102,8 +102,9 @@ jobs:
               rm jfs -rf
             fi
           done
+
           fail=false
-          set -x
+          mkdir fio || true
           for job in "${fio_jobs[@]}"; do
             echo job is:: $job
             bw_list=()
@@ -142,18 +143,20 @@ jobs:
                   fio --name=big-file-rand-read-preload --directory=${{ steps.vars.outputs.MOUNT_POINT }} --rw=randread --refill_buffers --size=${default_size} --filename=randread.bin --bs=$block_size --pre_read=1
                   sudo sync && echo 3 > /proc/sys/vm/drop_caches
                 fi
+
                 echo "start fio"
-                fio --name=$name --directory=${{ steps.vars.outputs.MOUNT_POINT }} $fio_arg > result.log
+                fio --name=$name --directory=${{ steps.vars.outputs.MOUNT_POINT }} $fio_arg > fio/result.log-$name-$juicefs_version
                 echo "finish fio"
-                bw_str=$(tail -1 result.log | awk '{print $2}' | awk -F '=' '{print $2}' )
+
+                bw_str=$(tail -1 fio/result.log-$name-$juicefs_version | awk '{print $2}' | awk -F '=' '{print $2}' )
                 bw=$(echo $bw_str | sed 's/.iB.*//g') 
                 if [[ $bw_str == *KiB* ]]; then
                   bw=$(echo "scale=2; $bw/1024.0" | bc -l)
                 elif [[ $bw_str == *GiB* ]]; then
                   bw=$(echo "scale=2; $bw*1024.0" | bc -l)
                 fi
-                
                 bw_list+=($bw)
+
                 echo $name, $bw, $juicefs_version, $default_size, ${{ github.ref_name }}, $(date +"%Y-%m-%d %H:%M:%S"), ${{github.sha}}, https://github.com/${{github.repository}}/actions/runs/${{github.run_id}},  redis, minio | tee -a $csv_file
               
                 ./$bin_name umount -f ${{ steps.vars.outputs.MOUNT_POINT }}
@@ -164,6 +167,7 @@ jobs:
                 mc rb  myminio/$name --force --dangerous || printf "Warining; remove bucket failed: %s, exit code: %s" "myminio/$name" "$?"
               fi
             done
+            
             new=${bw_list[0]}
             old=$(expr ${bw_list[1]}*$decrease_ratio | bc)
             echo new is $new, old is $old
@@ -172,7 +176,6 @@ jobs:
               fail=true
             fi
           done
-          set +x
           mysql -h 172.27.0.1 -u root -p${{secrets.MYSQL_PASSWORD}} -e "use  test_result; LOAD DATA INFILE '/var/lib/mysql-files/result.csv' INTO TABLE fio_test FIELDS TERMINATED BY ',' (name, bandwidth,  juicefs_version, size, ref_name, created_date, github_revision, workflow_url, meta_engine, storage); " 
           if $fail; then
             echo "Fatal: fio bandwidth decreased by 20% compared with last version, please check the result file"
@@ -185,6 +188,13 @@ jobs:
         with: 
           name: result.csv
           path: /var/lib/mysql-files/result.csv
+      
+      - name: Save fio logs
+        if: ${{always()}}
+        uses: actions/upload-artifact@v2
+        with: 
+          name: fio-logs
+          path: fio/
 
       - name: Clean After
         if: ${{always()}}

@@ -193,10 +193,7 @@ func closeFile(file *os.File) {
 	}
 }
 
-// Multiline log is supported
-var validLog = regexp.MustCompile(`^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}.\d{6}) .+\[(\d+)\] <(DEBUG|INFO|WARN|WARNING|ERROR|FATAL|PANIC)>:([\s|\S])*\[(\w+).go:(\d+)\]`)
-
-func copyLogFile(logPath, outDir, pid string, limit uint64) (fileName string, err error) {
+func copyLogFile(logPath, outDir string, limit uint64) (fileName string, err error) {
 	logFile, err := os.Open(logPath)
 	if err != nil {
 		return "", fmt.Errorf("error opening log file %s: %v", logPath, err)
@@ -206,47 +203,19 @@ func copyLogFile(logPath, outDir, pid string, limit uint64) (fileName string, er
 	tmpPath := path.Join(outDir, uuid.New().String())
 	tmpFile, err := os.Create(tmpPath)
 	if err != nil {
-		return "", fmt.Errorf("error opening log file %s: %v", tmpPath, err)
+		return "", fmt.Errorf("error creating log file %s: %v", tmpPath, err)
 	}
 	defer closeFile(tmpFile)
 	writer := bufio.NewWriter(tmpFile)
 
 	if limit > 0 {
-		st, err := logFile.Stat()
+		cmdStr := fmt.Sprintf("tail -n %d %s", limit, logPath)
+		ret, err := exec.Command("bash", "-c", cmdStr).Output()
 		if err != nil {
-			return "", fmt.Errorf("failed to stat log file %s: %v", logPath, err)
+			return "", fmt.Errorf("error tailing log: %v", err)
 		}
-
-		size := st.Size()
-		var offset int64 = -1
-		char := make([]byte, 1)
-		line := ""
-		// read the file in reverse order
-		for (-offset) <= size {
-			if _, err := logFile.Seek(offset, io.SeekEnd); err != nil {
-				logger.Fatalf("Failed to seek log file %s: %v", logPath, err)
-			}
-			if _, err = logFile.Read(char); err != nil {
-				logger.Fatalf("Failed to read log file %s: %v", logPath, err)
-			}
-
-			if char[0] == '\n' && len(line) != 0 && validLog.MatchString(line) {
-				field := strings.Fields(line)[2]
-				currPid := strings.TrimRight(field[strings.Index(field, "[")+1:], "]")
-				if currPid == pid {
-					if _, err := fmt.Fprintf(writer, "%s\n", line); err != nil {
-						logger.Fatalf("Failed to write log file: %v", err)
-					}
-					limit--
-				}
-				line = ""
-				if limit == 0 {
-					break
-				}
-			} else {
-				line = string(char) + line
-			}
-			offset--
+		if _, err = writer.Write(ret); err != nil {
+			return "", fmt.Errorf("failed to copy log file: %v", err)
 		}
 	} else {
 		reader := bufio.NewReader(logFile)
@@ -337,7 +306,7 @@ func checkAlive(port int, mp string) error {
 		}
 	}
 	if !flag {
-		return fmt.Errorf("mount point mismatch: %s", resp)
+		return fmt.Errorf("mount point mismatch: \n%s\n%s", resp, mp)
 	}
 
 	return nil
@@ -351,13 +320,16 @@ func reqAndSaveMetric(name, url, outDir string) error {
 	retPath := path.Join(outDir, fmt.Sprintf("juicefs.%s", name))
 	retFile, err := os.Create(retPath)
 	if err != nil {
-		logger.Fatalf("error opening log file %s: %v", retPath, err)
+		logger.Fatalf("error creating metric file %s: %v", retPath, err)
 	}
 	defer closeFile(retFile)
 
 	writer := bufio.NewWriter(retFile)
 	if _, err := writer.Write(resp); err != nil {
 		return fmt.Errorf("error writing metric %s: %v", name, err)
+	}
+	if err := writer.Flush(); err != nil {
+		logger.Fatalf("Failed to flush writer: %v", err)
 	}
 
 	return nil
@@ -448,7 +420,7 @@ JuiceFS Version:
 		}
 
 		limit := ctx.Uint64("limit")
-		tmpPath, err := copyLogFile(logPath, outDir, pid, limit)
+		tmpPath, err := copyLogFile(logPath, outDir, limit)
 		if err != nil {
 			return fmt.Errorf("error copying log file: %v", err)
 		}
@@ -502,10 +474,10 @@ JuiceFS Version:
 
 				m := metric.name[:strings.Index(metric.name, ".")]
 				if m == "profile" {
-					logger.Infof("Metric profile is sampling, sampling time: %ds...", profile)
+					logger.Infof("Metric profile is sampling, sampling time: %ds", profile)
 				}
 				if m == "trace" {
-					logger.Infof("Metric trace is sampling, sampling time: %ds...", trace)
+					logger.Infof("Metric trace is sampling, sampling time: %ds", trace)
 				}
 				if err := reqAndSaveMetric(metric.name, baseUrl+metric.url, pprofOutDir); err != nil {
 					logger.Errorf("Error saving metric %s: %v", m, err)

@@ -30,9 +30,9 @@ func TestDoctor(t *testing.T) {
 			args []string
 		}{
 			{"Simple cases", []string{"", "doctor"}},
-			{"Enable collecting syslog", []string{"", "doctor", "--syslog"}},
-			{"Max 5 log entries", []string{"", "doctor", "--syslog", "--limit", "5"}},
-			{"Enable collecting pprof metric", []string{"", "doctor", "--syslog", "--pprof"}},
+			{"Enable collecting syslog", []string{"", "doctor", "--collect-log"}},
+			{"Max 5 log entries", []string{"", "doctor", "--collect-log", "--limit", "5"}},
+			{"Enable collecting pprof metric", []string{"", "doctor", "--collect-log", "--collect-pprof"}},
 		}
 
 		for _, c := range cases {

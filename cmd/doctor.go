@@ -312,17 +312,25 @@ func checkAlive(port int, mp string) error {
 	return nil
 }
 
-func reqAndSaveMetric(name, url, outDir string) error {
-	resp, err := getRequest(url)
+type metricItem struct {
+	name, url string
+}
+
+func reqAndSaveMetric(name string, metric metricItem, outDir string) error {
+	resp, err := getRequest(metric.url)
 	if err != nil {
 		return fmt.Errorf("error getting metric: %v", err)
 	}
-	retPath := path.Join(outDir, fmt.Sprintf("juicefs.%s", name))
+	retPath := path.Join(outDir, fmt.Sprintf("juicefs.%s", metric.name))
 	retFile, err := os.Create(retPath)
 	if err != nil {
 		logger.Fatalf("error creating metric file %s: %v", retPath, err)
 	}
 	defer closeFile(retFile)
+
+	if name == "cmdline" {
+		resp = bytes.ReplaceAll(resp, []byte{0}, []byte{' '})
+	}
 
 	writer := bufio.NewWriter(retFile)
 	if _, err := writer.Write(resp); err != nil {
@@ -411,7 +419,7 @@ JuiceFS Version:
 	if err != nil {
 		return err
 	}
-	fmt.Printf("\nMount Command:\n%s\n", cmd)
+	fmt.Printf("\nMount Command:\n%s\n\n", cmd)
 
 	if ctx.Bool("collect-log") {
 		logPath, err := getLogPath(cmd)
@@ -448,17 +456,17 @@ JuiceFS Version:
 		baseUrl := fmt.Sprintf("http://localhost:%d/debug/pprof/", port)
 		trace := ctx.Uint64("trace-sec")
 		profile := ctx.Uint64("profile-sec")
-		metrics := []struct{ name, url string }{
-			{name: "allocs.pb.gz", url: "allocs"},
-			{name: "block.pb.gz", url: "block"},
-			{name: "cmdline.txt", url: "cmdline"},
-			{name: "goroutine.pb.gz", url: "goroutine"},
-			{name: "full.goroutine.stack.txt", url: "goroutine?debug=2"},
-			{name: "heap.pb.gz", url: "heap"},
-			{name: "mutex.pb.gz", url: "mutex"},
-			{name: "threadcreate.pb.gz", url: "threadcreate"},
-			{name: fmt.Sprintf("trace.%ds.pb.gz", trace), url: fmt.Sprintf("trace?seconds=%d", trace)},
-			{name: fmt.Sprintf("profile.%ds.pb.gz", profile), url: fmt.Sprintf("profile?seconds=%d", profile)},
+		metrics := map[string]metricItem{
+			"allocs":       {name: "allocs.pb.gz", url: baseUrl + "allocs"},
+			"blocks":       {name: "block.pb.gz", url: baseUrl + "block"},
+			"cmdline":      {name: "cmdline.txt", url: baseUrl + "cmdline"},
+			"goroutine":    {name: "goroutine.pb.gz", url: baseUrl + "goroutine"},
+			"fullstack":    {name: "full.goroutine.stack.txt", url: baseUrl + "goroutine?debug=2"},
+			"heap":         {name: "heap.pb.gz", url: baseUrl + "heap"},
+			"mutex":        {name: "mutex.pb.gz", url: baseUrl + "mutex"},
+			"threadcreate": {name: "threadcreate.pb.gz", url: baseUrl + "threadcreate"},
+			"trace":        {name: fmt.Sprintf("trace.%ds.pb.gz", trace), url: fmt.Sprintf("%strace?seconds=%d", baseUrl, trace)},
+			"profile":      {name: fmt.Sprintf("profile.%ds.pb.gz", profile), url: fmt.Sprintf("%sprofile?seconds=%d", baseUrl, profile)},
 		}
 
 		pprofOutDir := path.Join(outDir, fmt.Sprintf("pprof-%s-%s", prefix, currTime))
@@ -467,23 +475,22 @@ JuiceFS Version:
 		}
 
 		var wg sync.WaitGroup
-		for _, metric := range metrics {
+		for name, metric := range metrics {
 			wg.Add(1)
-			go func(metric struct{ name, url string }) {
+			go func(name string, metric metricItem) {
 				defer wg.Done()
 
-				m := metric.name[:strings.Index(metric.name, ".")]
-				if m == "profile" {
+				if name == "profile" {
 					logger.Infof("Metric profile is sampling, sampling time: %ds", profile)
 				}
-				if m == "trace" {
+				if name == "trace" {
 					logger.Infof("Metric trace is sampling, sampling time: %ds", trace)
 				}
-				if err := reqAndSaveMetric(metric.name, baseUrl+metric.url, pprofOutDir); err != nil {
-					logger.Errorf("Error saving metric %s: %v", m, err)
+				if err := reqAndSaveMetric(name, metric, pprofOutDir); err != nil {
+					logger.Errorf("Error saving metric %s: %v", name, err)
 				}
 
-			}(metric)
+			}(name, metric)
 		}
 		wg.Wait()
 	}

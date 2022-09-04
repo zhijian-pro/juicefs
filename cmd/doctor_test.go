@@ -24,6 +24,8 @@ import (
 )
 
 func TestDoctor(t *testing.T) {
+	mountTemp(t, nil, nil, nil)
+	defer umountTemp(t)
 	Convey("Positive doctor cases", t, func() {
 		cases := []struct {
 			name string
@@ -32,12 +34,11 @@ func TestDoctor(t *testing.T) {
 			{"Simple cases", []string{"", "doctor"}},
 			{"Enable collecting syslog", []string{"", "doctor", "--collect-log"}},
 			{"Max 5 log entries", []string{"", "doctor", "--collect-log", "--limit", "5"}},
-			{"Enable collecting pprof metric", []string{"", "doctor", "--collect-log", "--collect-pprof"}},
 		}
 
 		for _, c := range cases {
 			Convey(c.name, func() {
-				So(Main(c.args), ShouldBeNil)
+				So(Main(append(c.args, testMountPoint)), ShouldBeNil)
 			})
 
 		}
@@ -45,7 +46,7 @@ func TestDoctor(t *testing.T) {
 
 	Convey("Specify out dir", t, func() {
 		Convey("Use default out dir", func() {
-			So(Main([]string{"", "doctor"}), ShouldBeNil)
+			So(Main([]string{"", "doctor", testMountPoint}), ShouldBeNil)
 		})
 
 		outDir := "./doctor/ok"
@@ -53,7 +54,7 @@ func TestDoctor(t *testing.T) {
 			if err := os.MkdirAll(outDir, 0755); err != nil {
 				t.Fatalf("doctor error: %v", err)
 			}
-			So(Main([]string{"", "doctor", "--out-dir", outDir}), ShouldBeNil)
+			So(Main([]string{"", "doctor", "--out-dir", outDir, testMountPoint}), ShouldBeNil)
 			if err := os.RemoveAll(outDir); err != nil {
 				t.Fatalf("doctor error: %v", err)
 			}
@@ -68,7 +69,7 @@ func TestDoctor(t *testing.T) {
 		}
 		for _, c := range edgeCases {
 			Convey(c.name, func() {
-				So(Main([]string{"", "doctor", "--out-dir", c.outDir}), ShouldNotBeNil)
+				So(Main([]string{"", "doctor", "--out-dir", c.outDir, testMountPoint}), ShouldNotBeNil)
 			})
 		}
 	})

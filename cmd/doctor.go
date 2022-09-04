@@ -117,7 +117,7 @@ func getCmdMount(mp string) (pid, cmd string, err error) {
 	}
 
 	ret, err := exec.Command("bash", "-c", "ps -ef | grep 'juicefs mount' | grep "+mp).CombinedOutput()
-	if err != nil {
+	if err != nil && !strings.Contains(err.Error(), "exit status 1") {
 		return "", "", fmt.Errorf("failed to execute command `ps -ef | grep juicefs | grep %s`: %v", mp, err)
 	}
 
@@ -240,8 +240,8 @@ func getPprofPort(pid string) (int, error) {
 		cmdStr = "sudo " + cmdStr
 	}
 	ret, err := exec.Command("bash", "-c", cmdStr).CombinedOutput()
-	if err != nil {
-		return 0, fmt.Errorf("failed to execute command `ps -ef | grep juicefs`: %v", err)
+	if err != nil && !strings.Contains(err.Error(), "exit status 1") {
+		return 0, fmt.Errorf("failed to execute command `%s`: %v", cmdStr, err)
 	}
 	lines := strings.Split(string(ret), "\n")
 	if len(lines) == 0 {

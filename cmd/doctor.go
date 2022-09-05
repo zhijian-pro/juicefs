@@ -21,7 +21,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"math"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"os/exec"
@@ -34,7 +34,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/juicedata/juicefs/pkg/utils"
 
 	"github.com/urfave/cli/v2"
@@ -117,7 +116,7 @@ func getCmdMount(mp string) (pid, cmd string, err error) {
 	}
 
 	ret, err := exec.Command("bash", "-c", "ps -ef | grep 'juicefs mount' | grep "+mp).CombinedOutput()
-	if err != nil && !strings.Contains(err.Error(), "exit status 1") {
+	if err != nil {
 		return "", "", fmt.Errorf("failed to execute command `ps -ef | grep juicefs | grep %s`: %v", mp, err)
 	}
 
@@ -128,21 +127,17 @@ func getCmdMount(mp string) (pid, cmd string, err error) {
 			continue
 		}
 		cmdFields := fields[7:]
-		flag := false
 		for _, arg := range cmdFields {
 			if mp == arg {
-				flag = true
+				cmd = strings.Join(fields[7:], " ")
+				pid = fields[1]
 				break
 			}
 		}
-
-		if flag {
-			cmd = strings.Join(fields[7:], " ")
-			pid = fields[1]
-			break
-		}
 	}
-
+	if cmd == "" {
+		return "", "", fmt.Errorf("not found mount point: %s", mp)
+	}
 	return pid, cmd, nil
 }
 
@@ -193,17 +188,16 @@ func closeFile(file *os.File) {
 	}
 }
 
-func copyLogFile(logPath, outDir string, limit uint64) (fileName string, err error) {
+func copyLogFile(logPath, retLogPath string, limit uint64) error {
 	logFile, err := os.Open(logPath)
 	if err != nil {
-		return "", fmt.Errorf("error opening log file %s: %v", logPath, err)
+		return fmt.Errorf("error opening log file %s: %v", logPath, err)
 	}
 	defer closeFile(logFile)
 
-	tmpPath := path.Join(outDir, uuid.New().String())
-	tmpFile, err := os.Create(tmpPath)
+	tmpFile, err := ioutil.TempFile("", "juicefs-")
 	if err != nil {
-		return "", fmt.Errorf("error creating log file %s: %v", tmpPath, err)
+		return fmt.Errorf("error creating log file %s: %v", tmpFile.Name(), err)
 	}
 	defer closeFile(tmpFile)
 	writer := bufio.NewWriter(tmpFile)
@@ -212,24 +206,27 @@ func copyLogFile(logPath, outDir string, limit uint64) (fileName string, err err
 		cmdStr := fmt.Sprintf("tail -n %d %s", limit, logPath)
 		ret, err := exec.Command("bash", "-c", cmdStr).Output()
 		if err != nil {
-			return "", fmt.Errorf("error tailing log: %v", err)
+			return fmt.Errorf("tailing log error: %v", err)
 		}
 		if _, err = writer.Write(ret); err != nil {
-			return "", fmt.Errorf("failed to copy log file: %v", err)
+			return fmt.Errorf("failed to copy log file: %v", err)
 		}
 	} else {
 		reader := bufio.NewReader(logFile)
 		if _, err := io.Copy(writer, reader); err != nil {
-			return "", fmt.Errorf("failed to copy log file: %v", err)
+			return fmt.Errorf("failed to copy log file: %v", err)
 		}
 	}
 	if err := writer.Flush(); err != nil {
-		logger.Fatalf("Failed to flush writer: %v", err)
+		return fmt.Errorf("failed to flush writer: %v", err)
 	}
-	return tmpPath, nil
+	if err := os.Rename(tmpFile.Name(), retLogPath); err != nil {
+		return err
+	}
+	return nil
 }
 
-func getPprofPort(pid string) (int, error) {
+func getPprofPort(pid, mp string) (int, error) {
 	if !isUnix() {
 		logger.Warnf("Failed to get pprof port: %s is not supported", runtime.GOOS)
 		return 0, nil
@@ -240,7 +237,7 @@ func getPprofPort(pid string) (int, error) {
 		cmdStr = "sudo " + cmdStr
 	}
 	ret, err := exec.Command("bash", "-c", cmdStr).CombinedOutput()
-	if err != nil && !strings.Contains(err.Error(), "exit status 1") {
+	if err != nil {
 		return 0, fmt.Errorf("failed to execute command `%s`: %v", cmdStr, err)
 	}
 	lines := strings.Split(string(ret), "\n")
@@ -248,7 +245,7 @@ func getPprofPort(pid string) (int, error) {
 		return 0, fmt.Errorf("pprof will be collected, but no listen port")
 	}
 
-	var listenPort = math.MaxInt
+	var listenPort = -1
 	for _, line := range lines {
 		fields := strings.Fields(line)
 		if len(fields) != 0 {
@@ -257,12 +254,15 @@ func getPprofPort(pid string) (int, error) {
 				logger.Errorf("failed to parse port %v: %v", port, err)
 			}
 			if port >= 6060 && port <= 6099 && port <= listenPort {
-				listenPort = port
+				if err := checkPort(port, mp); err == nil {
+					listenPort = port
+				}
+				continue
 			}
 		}
 	}
 
-	if listenPort == math.MaxInt {
+	if listenPort == -1 {
 		return 0, fmt.Errorf("no valid pprof port found")
 	}
 	return listenPort, nil
@@ -291,7 +291,7 @@ func getRequest(url string) ([]byte, error) {
 }
 
 // check pprof service status
-func checkAlive(port int, mp string) error {
+func checkPort(port int, mp string) error {
 	url := fmt.Sprintf("http://localhost:%d/debug/pprof/cmdline?debug=1", port)
 	resp, err := getRequest(url)
 	if err != nil {
@@ -337,7 +337,7 @@ func reqAndSaveMetric(name string, metric metricItem, outDir string) error {
 		return fmt.Errorf("error writing metric %s: %v", name, err)
 	}
 	if err := writer.Flush(); err != nil {
-		logger.Fatalf("Failed to flush writer: %v", err)
+		return fmt.Errorf("failed to flush writer: %v", err)
 	}
 
 	return nil
@@ -360,19 +360,17 @@ func doctor(ctx *cli.Context) error {
 	}
 
 	outDir := ctx.String("out-dir")
-	_, err = os.Stat(outDir)
+	outDirInfo, err := os.Stat(outDir)
 	// special treatment for default out dir
-	if os.IsNotExist(err) && outDir == defaultOutDir {
-		logger.Warningf("out dir %s is not exist, created by default", outDir)
-		if err := os.Mkdir(outDir, 0777); err != nil {
+	if os.IsNotExist(err) {
+		if err := os.Mkdir(outDir, os.ModePerm); err != nil {
 			return fmt.Errorf("failed to create out dir %s: %v", outDir, err)
 		}
 	}
-	stat, err := os.Stat(outDir)
 	if err != nil {
 		return fmt.Errorf("failed to stat out dir %s: %v", outDir, err)
 	}
-	if !stat.IsDir() {
+	if !outDirInfo.IsDir() {
 		return fmt.Errorf("argument --out-dir must be directory %s", outDir)
 	}
 
@@ -428,31 +426,19 @@ JuiceFS Version:
 		}
 
 		limit := ctx.Uint64("limit")
-		tmpPath, err := copyLogFile(logPath, outDir, limit)
-		if err != nil {
+		retLogPath := path.Join(outDir, fmt.Sprintf("%s-%s.log", prefix, currTime))
+
+		if err := copyLogFile(logPath, retLogPath, limit); err != nil {
 			return fmt.Errorf("error copying log file: %v", err)
 		}
-
-		retLogPath := path.Join(outDir, fmt.Sprintf("%s-%s.log", prefix, currTime))
-		if err := os.Rename(tmpPath, retLogPath); err != nil {
-			return err
-		}
-
 		logger.Infof("Log %s is collected", logPath)
 	}
 
 	if ctx.Bool("collect-pprof") {
-		port, err := getPprofPort(pid)
+		port, err := getPprofPort(pid, mp)
 		if err != nil {
 			return err
 		}
-		if port == 0 {
-			return fmt.Errorf("invalid port: %v", port)
-		}
-		if err := checkAlive(port, mp); err != nil {
-			return fmt.Errorf("pprof server %v is not alive", port)
-		}
-
 		baseUrl := fmt.Sprintf("http://localhost:%d/debug/pprof/", port)
 		trace := ctx.Uint64("trace-sec")
 		profile := ctx.Uint64("profile-sec")
@@ -481,19 +467,17 @@ JuiceFS Version:
 				defer wg.Done()
 
 				if name == "profile" {
-					logger.Infof("Metric profile is sampling, sampling time: %ds", profile)
+					logger.Infof("Trace profile are being sampled, sampling duration: %ds", profile)
 				}
 				if name == "trace" {
-					logger.Infof("Metric trace is sampling, sampling time: %ds", trace)
+					logger.Infof("Trace metrics are being sampled, sampling duration: %ds", trace)
 				}
 				if err := reqAndSaveMetric(name, metric, pprofOutDir); err != nil {
 					logger.Errorf("Error saving metric %s: %v", name, err)
 				}
-
 			}(name, metric)
 		}
 		wg.Wait()
 	}
-
 	return nil
 }

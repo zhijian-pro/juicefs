@@ -405,7 +405,14 @@ SINGLE:
 	var in io.ReadCloser
 	var err error
 	if size == 0 {
+
 		in = io.NopCloser(bytes.NewReader(nil))
+		err := src.(object.FileSystem).Chmod(key, 0)
+		if _, ok := src.(object.FileSystem); ok {
+			if _, err = src.Get(key, 0, 0); err != nil {
+				return err
+			}
+		}
 	} else {
 		in, err = src.Get(key, 0, size)
 		if err != nil {

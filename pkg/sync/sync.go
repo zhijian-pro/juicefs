@@ -408,6 +408,7 @@ SINGLE:
 		in = io.NopCloser(bytes.NewReader(nil))
 		fmt.Println("size is 0")
 		fmt.Println("size is 0")
+		fmt.Println("size is 0")
 	} else {
 		in, err = src.Get(key, 0, size)
 		if err != nil {

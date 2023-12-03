@@ -179,7 +179,7 @@ func testStorage(t *testing.T, s ObjectStorage) {
 	if d, e := get(s, "test", 6, 2); e != nil || d != "" {
 		t.Logf("out-of-range get: '', but got %v, error: %s", len(d), e)
 	}
-	switch s.(*withPrefix).os.(type) {
+	switch s.(*WithPrefixObj).Os.(type) {
 	case FileSystem:
 		objs, err2 := listAll(s, "", "", 2, true)
 		if err2 == nil {
@@ -284,7 +284,7 @@ func testStorage(t *testing.T, s ObjectStorage) {
 			t.Logf("list with delimiter is not supported")
 		}
 	} else {
-		switch s.(*withPrefix).os.(type) {
+		switch s.(*WithPrefixObj).Os.(type) {
 		case FileSystem:
 			if len(obs) == 0 || obs[0].Key() != "" {
 				t.Fatalf("list should return itself")
@@ -326,7 +326,7 @@ func testStorage(t *testing.T, s ObjectStorage) {
 			t.Logf("list with delimiter is not supported")
 		}
 	} else {
-		switch s.(*withPrefix).os.(type) {
+		switch s.(*WithPrefixObj).Os.(type) {
 		case FileSystem:
 			if len(obs) == 0 || obs[0].Key() != "a/" {
 				t.Fatalf("list should return itself")

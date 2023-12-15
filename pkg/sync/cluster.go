@@ -338,7 +338,7 @@ func fetchJobs(tasks chan<- object.Object, config *Config) {
 		var jobs []object.Object
 		jobs, err = unmarshalObjects(ans)
 		if err != nil {
-			logger.Errorf("aa %s: %s", string(ans), err)
+			logger.Errorf("awa %s: %s", string(ans), err)
 			time.Sleep(time.Second)
 			continue
 		}

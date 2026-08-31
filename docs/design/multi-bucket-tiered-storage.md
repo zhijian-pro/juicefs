@@ -310,6 +310,35 @@ func migrateFile(inode, dstTier) error {
 孤儿态）由 gc 的 mtime 窗口（1h）+ 小批提交（INV-5）保护——该假设与现有
 正常写入路径完全同构。
 
+**推演：双向并发迁移（原方案丢数据场景在 D 下的对照）**
+
+原设计文档风险场景：A 做 bucket1→bucket2（拷贝完成、元数据已改、未删 b1
+旧副本）；B 反向做 bucket2→bucket1（拷贝、改元数据、删 b2 副本）；随后 A
+按其计划删除 b1 副本 ⇒ 数据在两个桶中都被删除。原方案以 ForbidOverwrite
+（对象层条件写）堵漏。同一交错在本方案下：
+
+```text
+初始:  chunk = [s0(b1)]，ref(s0)=1
+A:     Get s0@b1 → Put newA@b2
+       txn{ s0→newA, ref(newA)=1, ref(s0)-1→0 }
+       ⇒ s0@b1 进延迟删除（窗口内旧读者仍可读）
+B:     读 chunk 见 newA(b2)，目标 b1
+       Get newA@b2 → Put newB@b1        ← newB 是全新 key，≠ s0 的 key
+       txn{ newA→newB, ref(newB)=1, ref(newA)-1→0 }
+       ⇒ newA@b2 进延迟删除
+A:     后续批次事务校验：chunk 已不含 A 要替换的 id → 失败
+       且事务内 attr 校验 ≠ A 的目标 → ErrSuperseded，A 终止
+       A 手中不存在"待删列表"——删除从来不是工具的动作
+
+终态:  chunk = [newB(b1)]，全程每一时刻至少一份副本可读，零丢失
+```
+
+原方案丢数据的两个根因，本方案各废其一：**key 复用**（B 拷回 b1 用的是 s0
+的同一个 key，A 的删除会命中 B 刚写的数据）→ 每跳全新 rawID，key 永不复用；
+**删除是工具按既定计划执行的动作**（不校验当前元数据事实）→ 删除仅为已提交
+事务中 ref 归零的延迟副作用，陈旧计划无法通过事务校验、即无法产生删除。
+因此无需引入对象层条件写（ForbidOverwrite/If-None-Match）这一新依赖。
+
 **并发分析（迁移）**
 
 | 编号 | 场景 | 行为与结论 |
@@ -435,6 +464,21 @@ func fsck(inode) {
 **恢复设计的总原则**：所有中断态都落在"自描述、可读、可幂等重跑"的安全域内；
 唯一需要主动补救的只有孤儿对象（gc 兜底）。不存在需要人工判断"数据到底在哪"
 的状态。
+
+### 5.10 文件类型语义
+
+桶路由信息只存在两处——`Attr.Tier`（意图）与 slice id 高位（现实），故一个
+inode 类型是否受多桶影响，取决于它有没有 slice：
+
+| 类型 | 数据面 | 语义 |
+|---|---|---|
+| 普通文件 | 有 slice | 主场景，§5.1–5.9 全覆盖 |
+| 目录 | 无 | `Attr.Tier` 仅作**继承源**（`doMknod` 创建子节点时继承，三引擎一致）；`tier set <dir>` 默认只改意图（影响此后新建），`-r` 递归对子文件逐个迁移，目录自身无数据可迁 |
+| 软链接 | 无（target 只存元数据：Redis `s$inode` / SQL `symlink` 表 / TKV 同构） | 无路由问题；创建经 `Symlink→doMknod` 同样继承 Tier 但为**惰性字段**。CLI 语义：`tier set` 遇软链接**不跟随**（作用于链接 = no-op 并提示），递归遍历亦不跟随——防环、防止迁移越出目标子树 |
+| 硬链接 | 共享同一 inode | **天然一致**：所有链接路径共享同一 `Attr.Tier` 与同一组 slice，不存在"两路径两 tier"的表达空间（同 chmod 的 inode 属性语义；nlink>1 时迁移影响全部链接，用户文档提示）。与 clone 的区别：clone=新 inode 共享 slice（存在 M-4 场景），硬链接=同 inode（连 M-4 都不存在）。并发：不同路径同时迁移落到同一 inode 的 Attr CAS，复用 M-1 串行化；递归扫描遇多 dentry 第二次幂等跳过 |
+| FIFO/设备/socket | 无 | Tier 惰性继承，无影响 |
+| Trash 文件 | 保留 inode+slices | 过期删除走 sliceRef 归零 → 自路由（同 F-3） |
+| 内部虚拟文件（`.stats` 等） | 无 | 无影响 |
 
 ## 6. 多客户端并发矩阵（汇总）
 

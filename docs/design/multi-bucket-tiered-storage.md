@@ -370,6 +370,26 @@ func Clone(src, dst) {
 被重写为新 id（ref±1），src 引用的旧 id ref 仍 >0 不受影响 —— 每个文件的迁移
 只动自己的引用，共享关系由 ref 计数精确表达。
 
+**clone × 软链接**：clone 复制的是链接本身（symlink 表行 / `s$inode`，不解引
+用），零 slice、零 ref 操作，与多桶完全正交；链接指向哪个桶的文件无关——路由
+发生在打开目标文件时。
+
+**clone × 硬链接（放大风险与缓解）**：现状 clone **打断硬链接**（`Nlink>1`
+置 1，代码注释 `TODO: preserve hardlink`），树内同一 inode 的 N 个 dentry 克隆
+为 N 个独立 inode，共享源 slices（各 ref+1）。多桶推演：读取全部正确（slice 位
+自描述）；但对克隆树整体 `tier set -r` 时，N 个 inode 各自 mint 不同新 id ⇒
+源 1 份数据物化为 **N 份副本**。缓解：迁移工具维护会话级 `oldID→newID` 映射，
+批内遇已迁旧 id 直接在事务中替换为**同一个**新 id 并 `ref(new)+1`（不再
+Get/Put），跨 inode 保留共享、物理仅拷一份；映射为工具内存态，崩溃丢失仅退化
+为重新拷贝（放大不出错）。
+
+**clone 的 Tier 继承语义（显式决策）**：现状 clone 整行复制 node（含 Tier 列，
+`PRESERVE_ATTR` 只控制 uid/gid/mode/时间），产物**继承源的 Tier** 而非目标父
+目录——与 mknod 继承父目录不一致，但多桶下是正确选择：继承源 ⇒ 意图=现实
+（数据本就共享在源桶），clone 保持零拷贝、不隐式欠一次物化；继承目标父目录则
+clone 完成即"未收敛"，违背零拷贝初衷。**决策：维持继承源**；用户需要改层级时
+显式 `tier set -r`，成本可见。
+
 ### 5.6 Compact
 
 ```go

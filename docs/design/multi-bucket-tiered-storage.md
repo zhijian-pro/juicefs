@@ -383,6 +383,15 @@ func Clone(src, dst) {
 Get/Put），跨 inode 保留共享、物理仅拷一份；映射为工具内存态，崩溃丢失仅退化
 为重新拷贝（放大不出错）。
 
+**识别边界**：真硬链接可识别——树内按 readdir 的 inode 号去重，树外由
+`Nlink>1` 提示、`GetPaths`（Redis `p$inode` parent hash / SQL edge 反查 /
+TKV 同构）可列全部路径；被 clone 打断的"前硬链接"则 inode 层血缘**永久丢失、
+不可识别**。但去重映射不依赖识别 inode 血缘——它按 slice id 工作，共享事实
+在 slice 层永不丢失（即 sliceRef 本身），硬链接/clone/`copy_file_range` 各种
+共享形态被统一覆盖。跨会话迁移共享者会因映射丢失而各拷一份（放大不出错）；
+`tier apply` 批量场景可用 `ScanSlices` 预建 id→inodes 倒排，把共享者排入同一
+会话（调度优化，不影响正确性）。
+
 **clone 的 Tier 继承语义（显式决策）**：现状 clone 整行复制 node（含 Tier 列，
 `PRESERVE_ATTR` 只控制 uid/gid/mode/时间），产物**继承源的 Tier** 而非目标父
 目录——与 mknod 继承父目录不一致，但多桶下是正确选择：继承源 ⇒ 意图=现实

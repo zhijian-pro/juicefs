@@ -351,6 +351,23 @@ A:     后续批次事务校验：chunk 已不含 A 要替换的 id → 失败
 | M-6 | 迁移工具自身多实例（如两台机器跑 `tier apply`） | 同 M-1，Attr CAS 天然互斥到文件粒度；目录级任务用分片（按 inode 取模）避免无谓冲突。 |
 | M-7 | 迁移 与 老客户端 | 不可能并存：启用第二个桶时 `MinClientVersion` 已抬升，老客户端在 `Load` Format 时被 `CheckVersion` 拒绝（机制已存在）。 |
 
+**硬链接的迁移语义**：迁移的操作对象是 inode 而非路径，故 N 个链接**同时生效、
+天然原子**——tier 在 inode 上只有一个值、slice 只有一组，不存在"链接间层级
+分裂"或部分迁移的表达空间（同 chmod 的 inode 语义）。配套约定：
+
+- 单路径 `tier set` 遇 `Nlink>1`：照迁 + 警告，`GetPaths`（Redis `p$inode`
+  hash / SQL edge 反查 / TKV 同构）列出其他路径，告知影响面；
+- `-r` 递归：树内按 readdir 的 inode 号去重（不去重也会因"位已是目标"幂等
+  跳过）；存在树外链接时默认照迁 + 警告（同 `chmod -R` 语义），`tier apply`
+  自动化场景提供 `--skip-external-hardlinks` 保守跳过；
+- 想让不同链接不同层级：不可表达，逃生通道是先 `cp`/clone 断开共享再迁移
+  （clone 路线按 M-4 物化新副本，成本可见）；
+- 与 link/unlink 并发：`ln` 只加 dentry + nlink（不碰 Tier 与 chunk），与
+  Attr CAS、批事务均无冲突；unlink 至 trash 后迁移可继续但无意义（工具可在
+  批事务读 attr 时检测提前终止）；彻底删除则批事务校验失败终止，孤儿对象走
+  gc（F-1 路径）。硬链接未给迁移增加新的正确性场景，只增加告知义务与递归
+  策略开关。
+
 ### 5.5 Clone
 
 ```go

@@ -368,6 +368,23 @@ A:     后续批次事务校验：chunk 已不含 A 要替换的 id → 失败
   gc（F-1 路径）。硬链接未给迁移增加新的正确性场景，只增加告知义务与递归
   策略开关。
 
+**软链接的迁移语义**：链接本体无数据可迁（target 只是元数据字符串）。核心
+约束：**meta 层工具无法忠实跟随软链接**——target 以挂载点命名空间解释（绝对
+路径指向宿主机、相对路径依赖内核解析上下文），元数据层没有挂载点信息，按
+"卷根相对"强行解析可能命中碰巧同名的卷内文件而**迁错数据**。现状 CLI 的
+`m.Resolve` 逐分量 doLookup、完全不跟随（base.go Resolve），这是 meta 模式下
+唯一正确的选择（与 W-4 "宁可失败不静默落错桶"同一原则）。约定：
+
+- `tier set <symlink>`（meta 模式）：明确报告 "symlink has no data" 并退出
+  （现状静默设置惰性 Tier 后返回成功，属误导，需修正）；
+- 若未来支持挂载路径模式：显式参数经内核 `Stat` 跟随到目标（chmod 式语义，
+  ELOOP/ENOENT 由内核处理），忠实跟随仅在该模式下可行；
+- `-r` 递归与 `tier apply` 规则：**永不跟随**（防环、防越出子树、防"冷目录中
+  的链接把热数据拖冷"的策略意外），计数报告跳过数；
+- 链接自身的惰性 Tier 不更新，fsck/info 对软链接忽略 tier 字段；
+- `ln -sfn` 重定向与迁移并发：迁移作用于解析时刻的目标 inode，与 chmod
+  竞态同构，POSIX 常态。
+
 ### 5.5 Clone
 
 ```go
@@ -520,7 +537,7 @@ inode 类型是否受多桶影响，取决于它有没有 slice：
 |---|---|---|
 | 普通文件 | 有 slice | 主场景，§5.1–5.9 全覆盖 |
 | 目录 | 无 | `Attr.Tier` 仅作**继承源**（`doMknod` 创建子节点时继承，三引擎一致）；`tier set <dir>` 默认只改意图（影响此后新建），`-r` 递归对子文件逐个迁移，目录自身无数据可迁 |
-| 软链接 | 无（target 只存元数据：Redis `s$inode` / SQL `symlink` 表 / TKV 同构） | 无路由问题；创建经 `Symlink→doMknod` 同样继承 Tier 但为**惰性字段**。CLI 语义：`tier set` 遇软链接**不跟随**（作用于链接 = no-op 并提示），递归遍历亦不跟随——防环、防止迁移越出目标子树 |
+| 软链接 | 无（target 只存元数据：Redis `s$inode` / SQL `symlink` 表 / TKV 同构） | 无路由问题；创建经 `Symlink→doMknod` 同样继承 Tier 但为**惰性字段**。迁移语义见 §5.4（meta 层无法忠实跟随，`tier set` 遇软链接明确报告无数据；递归与规则永不跟随） |
 | 硬链接 | 共享同一 inode | **天然一致**：所有链接路径共享同一 `Attr.Tier` 与同一组 slice，不存在"两路径两 tier"的表达空间（同 chmod 的 inode 属性语义；nlink>1 时迁移影响全部链接，用户文档提示）。与 clone 的区别：clone=新 inode 共享 slice（存在 M-4 场景），硬链接=同 inode（连 M-4 都不存在）。并发：不同路径同时迁移落到同一 inode 的 Attr CAS，复用 M-1 串行化；递归扫描遇多 dentry 第二次幂等跳过 |
 | FIFO/设备/socket | 无 | Tier 惰性继承，无影响 |
 | Trash 文件 | 保留 inode+slices | 过期删除走 sliceRef 归零 → 自路由（同 F-3） |

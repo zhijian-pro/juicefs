@@ -280,6 +280,9 @@ func migrateFile(inode, dstTier) error {
             }
             // 2. 每批立即提交（PUT→提交窗口 << 1h，满足 INV-5）
             err := meta.Txn(func(tx) {
+                if tx.GetAttr(inode).Tier != dstTier { // 防乒乓：意图已被并发迁移改写
+                    return ErrSuperseded               // 整个迁移终止，让位给新意图
+                }
                 cur := tx.ReadChunk(inode, chunkIdx)
                 if !containsAll(cur, rewrites.old) {   // 乐观并发：chunk 被并发写/compact 改过
                     return ErrRetry                    // 整批重读重试（新对象成孤儿，交给 gc）
@@ -298,11 +301,20 @@ func migrateFile(inode, dstTier) error {
 }
 ```
 
+**无锁对象层的删除安全原则**：对象存储没有锁与事务，因此本设计规定**对象层
+永远不承载决策**——迁移工具没有"删除"步骤，删除只能是 meta 事务内 ref 归零
+的延迟副作用。由此，"刚写入的对象被并发迁移删除"需要同时突破三道防线：
+① 新对象 key 含全新 rawID（计数器原子分配、永不复用），无人知晓、无从同名
+互删；② 解引用它的事务必须先"看见"它并已把数据以更新的身份复制走
+（copy-then-swap 顺序）；③ 唯一不受事务保护的窗口（PUT 后、meta 提交前的
+孤儿态）由 gc 的 mtime 窗口（1h）+ 小批提交（INV-5）保护——该假设与现有
+正常写入路径完全同构。
+
 **并发分析（迁移）**
 
 | 编号 | 场景 | 行为与结论 |
 |---|---|---|
-| M-1 | C1、C2 对同一文件并发 `tier set`（不同目标） | 第 1 步 Attr CAS 保证只有一个工具在跑；后发者 CAS 失败退出（或按新意图重新发起）。**文档原方案中"双向迁移互删所有副本"的场景结构性消失**：每份物理副本 id 唯一，删除只经 sliceRef 归零。 |
+| M-1 | C1、C2 对同一文件并发 `tier set`（不同目标） | Attr CAS 串行化**意图翻转**，但注意：后发 CAS 以新的当前值为期望（expect=t2, set=t1）依然成功，故两个迁移的重写阶段**可以短暂同时活跃**。安全性不依赖互斥，而依赖：① 每份物理副本 id 唯一（新 rawID，key 永不复用，不存在同名互删）；② 删除不是工具的动作，只是事务内 ref 归零的延迟副作用——解引用一个 id 的事务必然已把数据以新身份复制走；③ **每批事务内校验 attr==本迁移目标**（伪代码 `ErrSuperseded`），后发意图使先发迁移在下一批立即终止，乒乓最多一批、只浪费不丢失。**原设计文档中"双向迁移互删所有副本"的场景结构性消失**。 |
 | M-2 | 迁移 与 并发写同文件 | 写走 Attr 新值（open 晚于 CAS）或旧快照（open 早于 CAS，落旧桶）。后者由第 3 步重扫收敛；重扫仍不净的（长期打开的写句柄）由 compact 最终收敛（compact 用当前 attr.Tier）。 |
 | M-3 | 迁移 与 compact 同 chunk | 两者都在事务内做 chunk 原位替换 → 乐观冲突，一方 `ErrRetry`。compact 产物已带新桶位（attr 已翻转）→ 迁移重读后发现位正确，跳过。无死锁、无丢失。 |
 | M-4 | 迁移 与 clone | clone 在事务内复制 slice 引用并 ref+1。若 clone 先行：迁移 ref-1 后旧 id ref 仍 >0 → **不删旧对象**，clone 文件继续可读（代价：两桶各一份，与原设计文档"clone 变两份数据，可接受"结论一致）。若迁移先行：clone 拿到的已是新 id。引擎事务保证两者串行化。 |

@@ -97,17 +97,17 @@ storage class，对象 key 只由 sliceID 派生，读取无需感知 tier。
 
 ```text
 bit 63    : 恒 0（PostgreSQL BIGINT 为有符号；nextChunk 计数器为 int64）
-bit 60-62 : 保留，恒 0（未来：格式版本/加密纪元等）
-bit 56-59 : BucketRef（4 位，最多 16 个桶注册表项）
+bit 59-62 : 保留，恒 0（bit 59 为 BucketRef 的显式拓宽预留位，见下）
+bit 56-58 : BucketRef（3 位 = 终身 8 个注册名额，ADR-1.2 修订）
 bit 0-55  : rawID（nextChunk 计数器域，≈7.2e16，按每秒百万 slice 可用 2000+ 年）
 ```
 
 ```go
 const (
     bucketRefShift = 56
-    bucketRefBits  = 4
-    bucketRefMask  = uint64(1<<bucketRefBits-1) << bucketRefShift // bit 56-59
-    reservedMask   = uint64(0xF) << 60                            // bit 60-63，恒 0
+    bucketRefBits  = 3
+    bucketRefMask  = uint64(1<<bucketRefBits-1) << bucketRefShift // bit 56-58
+    reservedMask   = uint64(0x1F) << 59                           // bit 59-63，恒 0
     rawIDMax       = uint64(1) << bucketRefShift
 )
 
@@ -125,13 +125,19 @@ func validateID(id uint64) error {
 }
 ```
 
+**拓宽回旋余地**：保留位恒 0 ⇒ 未来若 8 名额耗尽，可抬 `MinClientVersion`
+后把 bit 59 并入 BucketRef（3→4 位）：存量 id 的 bit 59 全为 0，解析值不变；
+只认 3 位的老客户端对新 ref≥8 的 id 触发保留位校验**显式拒绝**（而非误读）。
+**收窄不可逆，拓宽有版本门控下的可行路径**——这是位宽从小起步的依据。
+
 **位域测试向量表**（实现必须包含此表的单元测试）：
 
 | id (hex) | rawID | ref | 合法性 |
 |---|---|---|---|
 | `0x0000_0000_0000_0001` | 1 | 0 | 合法（存量数据形态） |
 | `0x0100_0000_0000_0001` | 1 | 1 | 合法 |
-| `0x0F00_0000_0000_002A` | 42 | 15 | 合法 |
+| `0x0700_0000_0000_002A` | 42 | 7 | 合法（最大 ref） |
+| `0x0800_0000_0000_0001` | — | — | 非法（bit 59 拓宽预留位被置位） |
 | `0x1000_0000_0000_0001` | — | — | 非法（bit 60 保留位被置位） |
 | `0x8000_0000_0000_0001` | — | — | 非法（bit 63，PG 有符号溢出） |
 
@@ -167,7 +173,7 @@ type Bucket struct {
 
 type Format struct {
     // ...现有字段...
-    Buckets map[uint8]Bucket // ref 1-15；ref 0 由旧字段虚拟合成（见下）
+    Buckets map[uint8]Bucket // ref 1-7；ref 0 由旧字段虚拟合成（见下）
     Tiers   map[uint8]Tier   // 现有结构扩展
 }
 
@@ -212,10 +218,10 @@ retired  : 全量扫描零引用后进入；仅保留只读+列举供 gc 清残�
    → gc/fsck 每轮顺带复核 marker↔ref 一致性 = 运行期持续检测，
      覆盖弱一致后端注册时的漏检
 ```
-- **16 个 ref 是卷的终身注册预算，不是并存桶数**：ref 不复用 ⇒ 每次 retire
-  永久消耗名额。endpoint 可变性已消除"换地址烧名额"这一主要消耗源；剩余
-  消耗事件 = 真实的新桶启用与桶弃用。产品决策必须以"卷生命周期内的桶变更
-  事件总数"评估位宽（§11 开放问题 1，§14 ADR 待确认项）。
+- **8 个 ref 是卷的终身注册预算，不是并存桶数**（ADR-1.2）：ref 不复用 ⇒
+  每次 retire 永久消耗名额。endpoint 可变性已消除"换地址烧名额"这一主要
+  消耗源；剩余消耗事件 = 真实的新桶启用与桶弃用。名额耗尽的兜底 = bit 59
+  拓宽路径（§3.1，版本门控下 3→4 位）。
 - `Format.Encrypt/Decrypt` **必须**扩展遍历 `Buckets[].AccessKey/SecretKey`
   （现状只处理三个固定字段）；三引擎 dump 的 `keepSecret` 脱敏同步扩展。
 
@@ -244,7 +250,7 @@ retired  : 全量扫描零引用后进入；仅保留只读+列举供 gc 清残�
   桶严禁多 ref 注册（注册时三层探测：指纹快筛 + 主动写探针 + 持久身份标记，
   见 §3.2；运行期由 gc/fsck 复核身份标记持续检测）；下线必须走完整
   状态机（§3.2），"零引用扫描"单独不构成下线证明。
-- **INV-4（ID 域）**：rawID < 2^56；bit 60-63 恒 0；持久输入校验失败返回
+- **INV-4（ID 域）**：rawID < 2^56；bit 59-63 恒 0；持久输入校验失败返回
   显式错误。
 - **INV-5（迁移在途双重保护）**：迁移新对象在 meta 提交前必须受两道保护：
   ① **migration reservation**（首个 PUT 前在 meta 登记、带过期时间，gc 视为
@@ -276,9 +282,17 @@ retired  : 全量扫描零引用后进入；仅保留只读+列举供 gc 清残�
 ```go
 // 替换现有 initStorageTiers 装饰器，构建于 Buckets 之上（与 Tiers 解耦）
 type bucketRouter struct {
-    stores [16]atomic.Pointer[ObjectStorage] // 凭证轮换/endpoint 变更时原子换实例
+    stores [8]atomic.Pointer[ObjectStorage] // 凭证轮换/endpoint 变更时原子换实例
 }
 ```
+
+**客户端全量预建（用户决策）**：挂载/gateway/SDK **启动时按注册表一次性
+预建全部桶的 storage client**（active/draining/sealed；retired 已证零引用，
+仅 gc/fsck 工具按需构建）——读写路径只做数组取用，**无懒初始化、无锁、
+无首次使用竞态**。预建是纯构造（不含网络 I/O，各后端 SDK client 构造即可）；
+`bucket_id` 身份标记复核在启动后**异步尽力**执行：复核不一致 → 禁用该桶
+实例并告警（读该桶文件 EIO）；某桶暂不可达**不阻塞挂载**（故障域隔离，
+§12.4），后台重试复核。Reload 新增桶时同样立即预建。
 
 **Key namespace 路由表**（第二轮评审 S0-4：同一 storage 还承载非 chunk
 对象——`meta/*` 元数据自动备份 vfs/backup.go:134、`testing/*` 连通性测试
@@ -961,7 +975,8 @@ per-bucket/tier 可观测指标与 `tier status` 收敛度量（§12.4）；rena
 
 **已确认**：
 
-1. ~~BucketRef 位宽~~ →（ADR-1.2）4 位，终身 16 名额；
+1. ~~BucketRef 位宽~~ →（ADR-1.2 修订）**3 位，终身 8 名额**；bit 59 为显式
+   拓宽预留位（版本门控下可 3→4 位，存量 id 不受影响）；
 2. ~~`tier apply` 宿主~~ → **一次性命令 + 外部 cron 调度**：断点/进度/限速
    状态持久于 meta 的 Job 表（ADR-1.4），cron 拉起的每次运行拾取 checkpoint
    续跑——宿主无状态，与持久 Job 控制面兼容；
@@ -1046,8 +1061,8 @@ atime 抖动数据集上"判冷→迁走→被读→判热→迁回"的每一跳
 兜底）；删除/gc 需 join 映射表；**同 key 跨桶复制重新引入双向迁移互删竞态**
 （正是本方案用"新 rawID"消灭的那一类），需 (id,bucket) 元组删除队列 +
 事务化驻留记录另行闭环，复杂度与 reservation 相当。落选理由：读路径引入
-元数据依赖，破坏"数据面自治"这一根设计原则。**重评触发条件**：若 §11.1
-的 16 名额预算被产品否决，E 是首选替代路线。
+元数据依赖，破坏"数据面自治"这一根设计原则。**重评触发条件**：若终身
+名额预算（8 个 + bit 59 拓宽至 16）仍被业务证明不足，E 是首选替代路线。
 
 ## 14. 决策变更记录（ADR-1，已确认）
 
@@ -1065,7 +1080,7 @@ ForbidOverwrite 对象层依赖，把双向迁移竞态从"条件写堵漏"变�
 | # | 决策点 | 结论 |
 |---|---|---|
 | 1 | 对外 tier 模型 | **半可变策略指针**：`Sc` 可改（成本操作、不影响正确性）；`BucketRef` 创建后**不可改**，换桶 = 新建 tier + 显式迁移。理由：消除全可变的三项代价——误操作爆炸半径（改指针 = 百万文件瞬间 unconverged + 自动搬数据账单）、审计不可追溯（Format 无定义变更历史）、多客户端传播窗口混桶；同时保留相对不可变模型的核心优势（改 sc 便宜、tier 数量 256、endpoint 变更已由注册表可变域承接）。已传播至 §2.1/§3.2/§5.4 op-C/W-3/§7.3 |
-| 2 | sliceID 位宽 | **4 位，终身 16 个注册名额**（明确"名额是消耗品"框架后确认）。位布局冻结 |
+| 2 | sliceID 位宽 | **3 位，终身 8 个注册名额**（初定 4 位，用户复核后收窄；bit 59 为显式拓宽预留位——未来经版本门控可 3→4 位，存量 id 解析值不变、老客户端显式拒绝而非误读。收窄不可逆、拓宽可行，故从小起步）。位布局冻结 |
 | 3 | 迁移写语义 | **不 fence，最终收敛**：如实显示 unconverged；严格排空（generation fence）后置为桶退役 sealed 阶段的能力（H-2） |
 | 4 | 持久迁移 Job | **Phase 2 必需**（job id / lease / checkpoint / 限速 / 进度） |
 

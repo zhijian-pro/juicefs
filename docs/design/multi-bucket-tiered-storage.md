@@ -394,7 +394,7 @@ placement 一律显式报错，不回退默认值。
 | W-1 | C1、C2 并发写同一文件（各自 open 快照的 tier 不同，例如中间隔了 tier set） | 各自的 slice 打各自的桶位，**都自描述、都可读**。文件暂时混桶，由迁移/compact 收敛。POSIX 对并发写本就不保证内容顺序，此处不引入新语义。 |
 | W-2 | 写入 与 `tier set`（SetAttr 翻转）并发 | 已 open 句柄继续写旧桶（快照），落下的是"旧位但正确"的数据；迁移工具重扫收敛（见 5.4）。**不存在错位数据**（对比文件级方案：attr 已新、数据在旧桶且无从判定）。 |
 | W-3 | 写入 与 tier 定义变更并发 | ADR-1.1 后 tier 的 BucketRef **不可改**，此场景只剩改 Sc：句柄用 open 快照的 sc，新 open 用新值——sc 漂移无害（不影响可读性），fsck 对账。原"改 BucketRef 并发"场景已被半可变决策**结构性消除**。 |
-| W-4 | C1 刚 `config` 加桶并设 tier，C2 的 Format 缓存尚未刷新（OnReload 周期），C2 打开 attr.Tier=新 tier 的文件 | C2 解析失败 → 强制 reload Format 重试 → 仍失败则 **EIO**。规则：宁可失败，绝不静默落错桶。 |
+| W-4 | C1 刚 `config` 加桶并设 tier，C2 的 Format 缓存尚未刷新（OnReload 周期），C2 打开 attr.Tier=新 tier 的文件 | C2 解析失败 → 强制 reload Format 重试 → 仍失败则 **EIO**（此时只剩真配置错误或 meta 不可达）。规则：宁可失败，绝不静默落错桶——与现状 `getRuntimeTier` 静默回退 tiers[0] 的行为相反，属有意变更。运维消窗口：先定义 tier、过一个心跳周期再让 attr 引用；`tier set` 内置提示。 |
 | W-5 | ID 批分配竞争 | 各客户端独立获取 4096 大小的 rawID 批（现状 `incrCounter("nextChunk")`），打标是本地位或，无新增竞争点。 |
 
 ### 5.2 writeback / staging

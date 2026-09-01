@@ -1,8 +1,8 @@
 # 多桶分层存储设计：sliceID 记桶引用 + Attr 记 tier 策略
 
-> 状态：**ADR-1 四项决策已确认（§14），位布局已冻结**；第二轮对抗性评审条款
-> 已合入正文，进入 Phase 1 实现的剩余前置 = §9 S0 条款实现级闭环 +
-> §11 中 Phase 1 相关未决项（#3/#6/#7）
+> 状态：**ADR-1 四项 + 开放问题 8 项决策已确认（§11/§14），位布局已冻结**；
+> 第二轮对抗性评审条款已合入正文。进入 Phase 1 的剩余前置 = §9 S0 条款
+> 实现级闭环（唯一未决：§11.4 retire 参数，Phase 2 细化时定）
 > 分支：`multi-bucket-design`
 > 前置阅读：现有单桶分层实现（`Attr.Tier` + `Format.Tiers` + `TierKey` ctx 链路）
 > 评审记录：本文档 §9/§12-14；外部评审 `workdoc/juicefs/评审记录/multi-bucket-tiered-storage-adversarial-review.md`
@@ -159,8 +159,9 @@ type Bucket struct {
     // 句柄同时生效且安全——只要仍指向同一逻辑容器。
     Storage   string
     Endpoint  string
-    AccessKey string
-    SecretKey string // 落库加密（防护等级的诚实评估见 §8）
+    AccessKey string // 可空（推荐）：空 = 本地凭证链（按 ref 命名的环境变量 /
+    SecretKey string // 凭证文件 / instance role），凭证不入 meta（决策 #6）；
+                     // 非空 = 信封便利模式（落库加密，防护等级见 §8）
     State     string // active → draining → sealed → retired（状态机见下）
 }
 
@@ -772,19 +773,31 @@ meta 备份的有效性坍缩到保留期（INV-6 / TrashDays）之内**。运�
 
 ## 8. 安全
 
-**威胁模型的诚实评估**（第二轮评审）：`Format.Encrypt` 的密钥派生自卷 UUID，
-而 UUID 与密文同存于 Format（config.go:237）——**防护等级 = 防误看，不防任何
-能读取 Format 的攻击者（自解密信封）**。多桶把 N 朵云的长期凭证放入同一个
-信封：任一客户端主机/进程沦陷 = 全部云账号桶凭证沦陷。这不是新引入的漏洞，
-是把既有弱点乘以 N——部署方必须显式接受该风险或采用下述缓解。
+**凭证分发模型（决策 #6，已确认）——凭证本地化为主推模式**：
 
-- Buckets 凭证纳入 `Format.Encrypt/Decrypt` 与 dump `keepSecret` 脱敏
-  （防误看层面的必做项，§3.2）；
-- 凭证轮换 = 注册表可变域操作，reload 原子交换实例（§4）；
-- 跨账号最小权限：每桶凭证只授予该桶读写删；gc/fsck 需列举权限，文档注明；
-- **缓解方向（开放问题 §11.6）**：短期凭证/STS/instance role；凭证引用
-  （Format 只存引用，客户端从本地文件/KMS 解引用）；按角色分权（普通客户端
-  不持删除与全桶列举权限，gc/迁移 worker 使用独立身份）。
+- **Format 只存桶身份**（Storage/Endpoint/State，路由正确性所需的集中信息），
+  Bucket 项凭证字段留空 ⇒ 客户端启动时为每个注册桶用**本地凭证链**初始化
+  client：按 ref 命名的环境变量（`JFS_BUCKET<ref>_ACCESS_KEY/SECRET_KEY`）、
+  凭证文件、云厂商 instance role/IRSA。现状先例：单桶已支持 format 不存
+  AK/SK、mount 走 env/instance profile，多桶只是扩展为按 ref 的命名约定；
+- **结构性收益**：meta 与 dump 中不存在凭证 ⇒ "自解密信封"风险整体消失；
+  每客户端最小权限成为可能（只读客户端配只读凭证，gc/迁移 worker 独立身份
+  持删除与列举权限）；
+- **代价（部署方知情）**：每台客户端为其可访问的桶配置本地凭证（K8s Secret
+  注入 / env / 文件）；缺某桶凭证的客户端读该桶文件得 auth 错误——符合
+  "宁可失败"原则，也是合法的裁剪部署（只碰热数据的客户端可不配冷桶凭证）；
+- **信封便利模式（保留）**：凭证写入 Format（信封加密）适合小规模部署。
+  诚实评估：`Format.Encrypt` 密钥派生自卷 UUID 且与密文同存（config.go:237），
+  **防护等级 = 防误看，不防任何能读 Format 的攻击者**；多桶信封 = N 朵云
+  凭证同一信封，任一客户端沦陷即全部泄露。生产跨账号部署应使用本地化模式。
+
+其余条款：
+
+- 信封模式下 Buckets 凭证纳入 `Format.Encrypt/Decrypt` 与 dump `keepSecret`
+  脱敏（§3.2）；
+- 凭证轮换：本地化模式 = 客户端本地操作 + 进程内 reload；信封模式 = 注册表
+  可变域操作，reload 原子交换实例（§4）；
+- 跨账号最小权限：每桶凭证只授予该桶读写删；gc/fsck 需列举权限，文档注明。
 
 ## 9. 评审必须项（两轮合并，Must-fix）
 
@@ -841,9 +854,15 @@ per-bucket/tier 可观测指标与 `tier status` 收敛度量（§12.4）；rena
 6. gc（MISPLACED/UNKNOWN_REF 只报告、reservation 感知、窗口下限）/ fsck /
    destroy / info 多桶适配；
 7. 版本门控两阶段激活 + Shards 互斥 + `--storage-class` 废弃告警；
-8. 测试：三引擎共享测试、dump/load round-trip（含计数器域与 ref 存在性校验）、
+8. 凭证本地化模式：按 ref 的本地凭证链解析（env/文件/instance role，
+   决策 #6）；信封模式的加密/脱敏并存；
+9. 测试：三引擎共享测试、dump/load round-trip（含计数器域与 ref 存在性校验）、
    PG 边界、混合版本（含已挂载老客户端行为）、加密 round-trip、
    gc 泄露/错桶/过期 Format 注入。
+
+**里程碑顺序**：mount + 核心工具（gc/fsck/destroy/config/info）先行验收；
+**SDK（Java）与 gateway 为 Phase 1 内后置里程碑**——发布前必须完成适配与
+测试，但不阻塞主线开发（决策 #3）。
 
 **Phase 2 迁移**
 
@@ -862,28 +881,40 @@ per-bucket/tier 可观测指标与 `tier status` 收敛度量（§12.4）；rena
 
 **Phase 3 策略自动化**
 
-1. tier 定义 CRUD 完整化（op-C）+ retire/tombstone 全流程工具；
-2. `tier apply` 后台规则引擎（path/size/atime → tier）：**滞回与冷却期、
-   每日迁移预算上限**（§12.3）、断点、分片；
-3. 凭证分发增强（STS/引用/分权，视 §11.6 决策）。
+1. tier 定义 CRUD 完整化（op-C 改 Sc）+ retire/tombstone 全流程工具；
+2. `tier apply` 规则引擎：**一次性命令 + 外部 cron 调度**（决策 #2，断点
+   状态在 meta Job 表，每次运行拾取 checkpoint 续跑）；**滞回与冷却期、
+   每日迁移预算上限**（§12.3）、分片；
+3. per-bucket 用量统计（决策 #8：扫描型，不做写路径实时计数器）；
+4. 凭证分发增强（KMS 引用等，视部署反馈）；`WriteClass` 字段视需求实现
+   （决策 #5：schema 预留）。
 
-## 11. 开放问题
+## 11. 开放问题（决策进展）
 
-1. ~~BucketRef 位宽~~ **已确认（ADR-1.2）**：4 位，终身 16 名额；
-2. `tier apply` 形态：一次性命令 vs 常驻任务 vs 独立组件（Job 控制面已定为
-   Phase 2 必需，此处只剩宿主形态）；
-3. Java/Python SDK 与 gateway 的 Phase 1 支持范围（全量 or 只读）；
-4. retire 的 N 值、sealed 排空的验证手段与 tombstone 的人工处理清单格式；
-5. 归档桶直写的成本策略：是否提供 `write-through-class`；
-6. 凭证分发模型：自解密信封是否可接受（§8），STS/凭证引用/角色分权的
-   优先级与形态；
-7. rename 语义：`mv` 跨 tier 目录不重继承（现状 inode 属性语义）是否维持——
-   维持则 path 规则引擎必须有滞回防反复搬运；改变则违反 POSIX 直觉，
-   倾向维持 + 文档化；
-8. per-bucket 用量统计与配额（跨账号计费必答题，`usedSpace` 现为全局
-   计数器）：Phase 2 还是 Phase 3；
-9. ~~严格排空是否 Phase 2 必需~~ **已确认（ADR-1.3）**：迁移不 fence 写，
-   严格排空作为 H-2 后置能力（桶退役 sealed 阶段才必需）。
+**已确认**：
+
+1. ~~BucketRef 位宽~~ →（ADR-1.2）4 位，终身 16 名额；
+2. ~~`tier apply` 宿主~~ → **一次性命令 + 外部 cron 调度**：断点/进度/限速
+   状态持久于 meta 的 Job 表（ADR-1.4），cron 拉起的每次运行拾取 checkpoint
+   续跑——宿主无状态，与持久 Job 控制面兼容；
+3. ~~SDK/gateway Phase 1 范围~~ → **mount + 核心工具先行验收；SDK/gateway
+   为 Phase 1 内后置里程碑**（发布前必须完成，不阻塞主线开发）；
+5. ~~归档直写~~ → **tier schema 预留 `WriteClass` 字段、暂不实现**；归档层
+   直写成本先靠文档 + 桶侧生命周期；
+6. ~~凭证分发~~ → **凭证本地化为主推模式**（凭证不入 meta，本地凭证链按
+   ref 解析；信封模式保留为便利选项），详见 §8；
+7. ~~rename 语义~~ → **维持不重继承**（POSIX inode 属性语义，同 chmod）；
+   "目录即层级"的需求由 `tier apply` 规则 + 滞回（§12.3）兜底，用户文档
+   明确此行为；
+8. ~~per-bucket 用量统计~~ → **Phase 3**（届时优先扫描型统计，不做写路径
+   实时计数器）；
+9. ~~严格排空~~ →（ADR-1.3）不 fence，最终收敛；严格排空为桶退役 sealed
+   阶段能力。
+
+**未决（Phase 2 设计细化时定）**：
+
+4. retire 的 N 值、sealed 排空验证手段与 tombstone 清单格式（建议默认：
+   N=3 可配 + session 枚举验证 + JSON 残留清单，届时确认）。
 
 ## 12. 成本模型与故障域（第二轮评审新增）
 

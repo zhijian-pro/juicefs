@@ -204,10 +204,11 @@ retired  : 全量扫描零引用后进入；仅保留只读+列举供 gc 清残�
   SecretKey` 字段**虚拟合成，不写入 Buckets map**。load/config 时若发现
   ref 0 实体项 → 显式拒绝（消除双重权威来源，第二轮评审 Medium）。
 
-**注册查重协议**（S0-1 检测手段，从 endpoint 指纹升级为三层探测）：
+**注册与地址变更的配置事务协议**（S0-1 预防手段；所有配置进入点都有守门，
+运行期无需巡逻）：
 
 ```text
-注册新桶 ref=N：
+注册新桶 ref=N（config 事务，前置全部通过才写 Format）：
 1. 指纹快筛：规范化 endpoint（scheme/host/bucket 名）比对，免费先挡低级重复
 2. 主动探针：向新桶写 <name>/probe_<random> → 对所有已注册桶 Head 同 key
    → 任一可见 = 同一物理桶（写入透过两个地址可见）→ 拒绝；随后删除探针。
@@ -215,8 +216,11 @@ retired  : 全量扫描零引用后进入；仅保留只读+列举供 gc 清残�
 3. 持久身份标记：写 <name>/bucket_id = {volumeUUID, ref, 注册时间}
    → 注册时新桶已存在本卷 bucket_id（其他 ref）= 别名或既有桶的拷贝 → 拒绝
      （主动探针抓不到"注册前拷贝"，标记可以）
-   → gc/fsck 每轮顺带复核 marker↔ref 一致性 = 运行期持续检测，
-     覆盖弱一致后端注册时的漏检
+
+变更 ref=N 的 endpoint/凭证（config 事务）：
+   前置条件 = 经【新地址/新凭证】读到匹配的 bucket_id（卷 UUID + ref=N 一致）
+   → 不匹配/读不到：拒绝写入 Format
+   ⇒ 错误地址根本进不了注册表，客户端无条件信任注册表（§4 结构性预防之二）
 ```
 - **8 个 ref 是卷的终身注册预算，不是并存桶数**（ADR-1.2）：ref 不复用 ⇒
   每次 retire 永久消耗名额。endpoint 可变性已消除"换地址烧名额"这一主要
@@ -242,13 +246,13 @@ retired  : 全量扫描零引用后进入；仅保留只读+列举供 gc 清残�
   删除只发生在正面确认正确桶有完好副本之后）；**尺寸不符/heal 失败**的只报告
   留人工。**禁止基于负证据（404/单信号"位≠桶"）的删除**——"错位"信号无法
   区分"多余拷贝"与"bug 写错地方的唯一真身"，而后者经 heal 可完整恢复
-  （错位副本对读者本就不可见，heal 同时修复读故障）。错位写入本身由两道
-  结构性防线预防（§4：PUT 点自断言 + 身份标记复核）。
+  （错位副本对读者本就不可见，heal 同时修复读故障）。错位写入本身由 §4
+  结构性预防（绑定点合一 + 配置事务前置校验）从构造上消除。
 - **INV-2（可读）**：meta 中存在的 slice，其 id 位声明的桶中必须有**全部
   block**（迁移保留期内的旧副本读取例外，见 INV-6）。
 - **INV-3（注册表身份）**：ref ↔ 逻辑容器绑定不可变；ref 永不复用；同一物理
-  桶严禁多 ref 注册（注册时三层探测：指纹快筛 + 主动写探针 + 持久身份标记，
-  见 §3.2；运行期由 gc/fsck 复核身份标记持续检测）；下线必须走完整
+  桶严禁多 ref 注册；一切进入注册表的配置（注册/改地址/改凭证）必须通过
+  §3.2 配置事务的前置校验——**错误配置进不了 Format**；下线必须走完整
   状态机（§3.2），"零引用扫描"单独不构成下线证明。
 - **INV-4（ID 域）**：rawID < 2^56；bit 59-63 恒 0；持久输入校验失败返回
   显式错误。
@@ -271,11 +275,11 @@ retired  : 全量扫描零引用后进入；仅保留只读+列举供 gc 清残�
     向目标端收敛拷贝；
   - D3. 安全态下的冗余副本可删。
   推论：**单副本必在目标端；双副本至少一个在目标端**。逐操作保持性：
-  写入经 PUT 自断言直落目标端；heal 全程副本数 ≥1 且删除仅在回读验证后
-  （§5.7）；gc 泄露删除仅作用于死对象；迁移不触碰同 key、旧 id 变死后才删
-  （INV-6 队列）。INV-7 不承诺违规态不出现（预防靠 §4 两道防线），承诺
-  **任何操作不制造/加深违规态，heal 单调收敛回安全态**。基于负证据
-  （404/单信号）的删除违反 D2，全域禁止。
+  写入经绑定点合一直落目标端（§4：位与去向同源，结构上不可分叉）；heal
+  全程副本数 ≥1 且删除仅在回读验证后（§5.7）；gc 泄露删除仅作用于死对象；
+  迁移不触碰同 key、旧 id 变死后才删（INV-6 队列）。INV-7 不承诺违规态
+  不出现（预防靠 §4 结构性预防），承诺**任何操作不制造/加深违规态，heal
+  单调收敛回安全态**。基于负证据（404/单信号）的删除违反 D2，全域禁止。
 
 ## 4. 存储层
 
@@ -289,10 +293,8 @@ type bucketRouter struct {
 **客户端全量预建（用户决策）**：挂载/gateway/SDK **启动时按注册表一次性
 预建全部桶的 storage client**（active/draining/sealed；retired 已证零引用，
 仅 gc/fsck 工具按需构建）——读写路径只做数组取用，**无懒初始化、无锁、
-无首次使用竞态**。预建是纯构造（不含网络 I/O，各后端 SDK client 构造即可）；
-`bucket_id` 身份标记复核在启动后**异步尽力**执行：复核不一致 → 禁用该桶
-实例并告警（读该桶文件 EIO）；某桶暂不可达**不阻塞挂载**（故障域隔离，
-§12.4），后台重试复核。Reload 新增桶时同样立即预建。
+无首次使用竞态**。预建是纯构造（不含网络 I/O）；某桶运行期不可达只影响
+该桶的文件（故障域隔离，§12.4），不阻塞挂载。Reload 新增桶时同样立即预建。
 
 **Key namespace 路由表**（第二轮评审 S0-4：同一 storage 还承载非 chunk
 对象——`meta/*` 元数据自动备份 vfs/backup.go:134、`testing/*` 连通性测试
@@ -314,16 +316,24 @@ key 路由到单桶；`Limits` 取各桶交集；`Shutdown` 广播；任何方�
 **无限重试**（sharding.go:147-152）且任一子桶失败即整体失败，一个 retired
 桶凭证过期会挂死全部工具。没有任何调用者真正需要全局有序流。
 
-**错位写入的两道结构性防线**：
+**错位写入的结构性预防（by construction，取代运行时防线——用户决策）**：
 
-1. **PUT 点自断言**：每个 per-ref storage 实例在 Put 时校验
-   `bucketRefOf(parseSliceID(key)) == 自身 ref`，不匹配拒写（`ErrMisroute`）。
-   key 自带真相 ⇒ 上游路由表过期、reload 竞态、映射 bug 整类被挡在落盘前。
-   唯一漏网的"打标本身打错"产生的是**自洽数据**（key/meta/落桶三者一致，
-   可读、可迁移收敛），不产生错位、不丢数据；
-2. **身份标记复核**：客户端初始化/Reload 每个桶实例时校验 `bucket_id`
-   标记与自身 ref 一致（§3.2），不一致拒绝启用该桶——防"endpoint 改错
-   指向别的物理桶"这一错位来源。
+1. **绑定点合一**：写路径不做第二次路由判断。open 时快照的是**桶实例引用
+   本身**（而非 ref 数字），打标由该实例执行（`h.store.StampID(rawID)`）——
+   **key 位与字节去向由同一个对象产生，结构上不存在分叉的代码路径**，
+   PUT 断言成为同义反复、无需存在。路由表过期/reload 竞态对写路径失效
+   （句柄持实例指针，不查表）。读/删仍按 key 解析路由，但方向无害：
+   读错桶 = 404（fail-safe），删错桶 = 删不存在的 key（no-op）——危险方向
+   只有写，而写已被构造封死。可信基座收敛为单一 key 解析函数，由 §3.1
+   位域测试向量表穷举覆盖；
+2. **配置事务前置校验**：注册新桶（三层探测，§3.2）与**变更 endpoint**
+   都是 config 事务，前置条件 = 经新地址读到匹配的 `bucket_id` 标记
+   （卷 UUID + ref 一致），不匹配拒绝写入 Format——**错误地址根本进不了
+   注册表**，客户端无条件信任注册表，无需任何启动/运行期复核；
+3. **信任边界声明**：校验通过后带外世界的变化（DNS 被重指、桶被删除重建）
+   在边界外——与今天单桶 JuiceFS 的暴露面完全相同，多桶不新增此类风险。
+   INV-7 / heal（§5.7）保留为最后恢复网：预防到位后它应当永远沉睡，
+   但删除纪律不因预防存在而放松。
 
 装饰器顺序：`encrypted( bucketRouter{ ref→prefix(blob) } )`。
 卷级 `Compression`/`EncryptKey` 全局统一，跨桶数据格式一致。
@@ -352,17 +362,19 @@ func Open(inode) *handle {
         def, ok = format.Tiers[attr.Tier]
         if !ok { return EIO }      // 绝不静默回退默认桶
     }
-    h := &handle{inode: inode, bucketRef: def.BucketRef, sc: def.Sc}
+    // 绑定点合一（§4）：快照的是【桶实例引用本身】，不是 ref 数字
+    h := &handle{inode: inode, store: router.stores[def.BucketRef], sc: def.Sc}
     return h
 }
 
 // 写数据块
 func (s *sliceWriter) flush() {
     rawID := meta.NewSlice()                     // 4096 批分配，客户端本地
-    s.id = stampID(rawID, s.h.bucketRef)         // ← 打标点：首个 PUT 之前
+    s.id = s.h.store.StampID(rawID)              // 打标由桶实例执行：位与去向同源，
+                                                 // 结构上不存在"位说桶2、写进桶1"的路径
     for indx, block := range s.blocks {
-        ctx := WithValue(ctx, PlacementKey{}, placement{s.h.bucketRef, s.h.sc})
-        router.Put(ctx, key(s.id, indx, len), block) // 桶由 key 中 id 位决定
+        ctx := WithValue(ctx, PlacementKey{}, placement{s.h.store.Ref(), s.h.sc})
+        s.h.store.Put(ctx, key(s.id, indx, len), block) // 写入同一实例，无第二次路由判断
     }
     meta.Write(inode, chunkIdx, slice{id: s.id, ...}) // meta 提交（含 sliceRef 登记）
 }
@@ -391,7 +403,7 @@ placement 一律显式报错，不回退默认值。
 func (s *wSlice) upload(indx) {
     key := key(s.id, indx, blen)          // 打标 id 已在 key 中 → 桶信息已持久化在文件名里
     if writeback {
-        bcache.stage(key, data, footer{bucketRef: s.h.bucketRef, sc: s.h.sc})
+        bcache.stage(key, data, footer{bucketRef: s.h.store.Ref(), sc: s.h.sc})
         // 上传（立即或延迟）：
         //   桶：key 中 id 位自路由（重启回放 scanStaging 同样成立）
         //   sc：读 footer（写入时刻的意图快照，不受 tier 定义后续变更影响）
@@ -457,6 +469,7 @@ func migrateFile(inode, dstTier) error {
         return ErrConflict // 另一个迁移已改意图，本工具退出
     }
     dst := format.Tiers[dstTier]
+    dstStore := router.stores[dst.BucketRef]      // 绑定点合一：目标实例解析一次
     dedup := map[uint64]uint64{}                  // 会话级 oldID→newID 共享去重（§5.5）
 
     for each chunk of inode {
@@ -468,7 +481,8 @@ func migrateFile(inode, dstTier) error {
                 if bucketRefOf(s.id) == dst.BucketRef { continue }  // 幂等：已在目标桶
                 newID, seen := dedup[s.id]
                 if !seen {
-                    newID = stampID(meta.NewSlice(), dst.BucketRef) // 全新身份，永不碰撞
+                    newID = dstStore.StampID(meta.NewSlice()) // 打标由目标实例执行（§4 绑定点合一），
+                                                              // 全新身份，永不碰撞
                     // 3. 完整 block manifest 复制 + 校验（S0-5）：
                     //    一个 slice 是多个 block 对象（key(id, indx, blockSize)），
                     //    必须全部复制并逐块校验 size/checksum 后才允许换 ID——
@@ -476,7 +490,7 @@ func migrateFile(inode, dstTier) error {
                     for indx := range blockManifest(s) {
                         data, err := srcBlob.Get(key(s.id, indx, ...))
                         if err == ENOENT { skipSlice }              // S-1：staged 未上传，下轮再迁
-                        dstBlob.Put(ctx{placement{dst.BucketRef, dst.Sc}}, key(newID, indx, ...), data)
+                        dstStore.Put(ctx{placement{dst.BucketRef, dst.Sc}}, key(newID, indx, ...), data)
                     }
                     verifyManifest(newID, s)                        // 逐块 Head 校验 size
                     resv.Add(newID)
@@ -890,7 +904,7 @@ meta 备份的有效性坍缩到保留期（INV-6 / TrashDays）之内**。运�
 
 | # | 条款 | 落点 | 来源 |
 |---|---|---|---|
-| S0-1 | 错位对象删除纪律：INV-7 副本安全不变量为总纲（单副本必在目标端、双副本至少一个在目标端、删除仅随正证据）→ gc 内置 heal 协议（copy-verify-delete，§5.7）；PUT 点自断言 + 身份标记复核两道预防线（§4）；注册三层探测（§3.2）；**注册后的桶间手动拷贝列为运维禁令**（用户确认） | §3.2 / §3.4 INV-7 / §4 / §5.7 | 红队发现；INV-7 与 heal 闭环采纳自决策讨论 |
+| S0-1 | 错位对象删除纪律：INV-7 副本安全不变量为总纲（单副本必在目标端、双副本至少一个在目标端、删除仅随正证据）→ gc 内置 heal 协议（copy-verify-delete，§5.7）；错位写入由**结构性预防**消除（§4 绑定点合一 + §3.2 配置事务前置校验——后者同时是 heal 在别名场景下正确性的前提）；**注册后的桶间手动拷贝列为运维禁令**（用户确认） | §3.2 / §3.4 INV-7 / §4 / §5.7 | 红队发现；探针、INV-7、构造性预防均采纳自决策讨论 |
 | S0-2 | migration reservation（首道防线）+ gc 窗口安全下限（封 `JFS_GC_SKIPPEDTIME` 后门）+ INV-6 独立保留期（脱钩 TrashDays=0 立即删）+ 提交后 Head 自愈 | §3.4 / §5.4 / §5.7 | 双方 |
 | S0-3 | 版本门控两阶段激活（活跃会话版本扫描）；撤回"机制已存在"（`Load(false)` 不复查已证伪） | §7.1 / M-7 | 双方（外部证伪） |
 | S0-4 | key namespace 路由表（`meta/`、`testing/`、`juicefs_uuid` 控制对象恒 ref 0）+ chunk key 解析失败显式报错、绝不回退 ref 0 | §4 | 外部独有 |

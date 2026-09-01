@@ -538,6 +538,13 @@ func migrateFile(inode, dstTier) error {
 }                                     //    → 未 swap 的 ref 归零 → 现有延迟删除清孤儿
 ```
 
+> **事务粒度依据（chunk × 批）**：slice 条目在三引擎中都不是独立寻址实体
+> （Redis 整 list WATCH / SQL 整行 blob 校验 / TKV 整 value CAS），**冲突检测
+> 单位天然是整个 chunk 记录**——slice 级事务不缩小冲突域，只把同一冲突域
+> 反复锁 N 次（N 倍固定开销、N 倍撞并发写的机会、同 id 多条目跨事务的中间
+> 态复杂化，零收益）；文件级则超出引擎单事务能力且重试代价爆炸。批上限
+> （≈64 条目）压单次事务时长与重做成本。与现状 compact 事务形态同构。
+
 > **CopyFileRange 同 id 多条目警示（H-3）**：同一 slice id 可在同一/相邻 chunk
 > 出现多个条目（不同 off/len，redis.go:3260-3274 按条目 RPush 且逐条目 ref+1）。
 > `ReplaceSliceEntries` 必须按**条目位置**替换并按条目数增减 ref；若按 id 全局

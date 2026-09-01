@@ -197,6 +197,21 @@ retired  : 全量扫描零引用后进入；仅保留只读+列举供 gc 清残�
 - **ref 0 的唯一权威来源**：ref 0 永远由现有 `Storage/Bucket/AccessKey/
   SecretKey` 字段**虚拟合成，不写入 Buckets map**。load/config 时若发现
   ref 0 实体项 → 显式拒绝（消除双重权威来源，第二轮评审 Medium）。
+
+**注册查重协议**（S0-1 检测手段，从 endpoint 指纹升级为三层探测）：
+
+```text
+注册新桶 ref=N：
+1. 指纹快筛：规范化 endpoint（scheme/host/bucket 名）比对，免费先挡低级重复
+2. 主动探针：向新桶写 <name>/probe_<random> → 对所有已注册桶 Head 同 key
+   → 任一可见 = 同一物理桶（写入透过两个地址可见）→ 拒绝；随后删除探针。
+   不受地址形态影响（内外网/CNAME/IP/path-style 全覆盖）
+3. 持久身份标记：写 <name>/bucket_id = {volumeUUID, ref, 注册时间}
+   → 注册时新桶已存在本卷 bucket_id（其他 ref）= 别名或既有桶的拷贝 → 拒绝
+     （主动探针抓不到"注册前拷贝"，标记可以）
+   → gc/fsck 每轮顺带复核 marker↔ref 一致性 = 运行期持续检测，
+     覆盖弱一致后端注册时的漏检
+```
 - **16 个 ref 是卷的终身注册预算，不是并存桶数**：ref 不复用 ⇒ 每次 retire
   永久消耗名额。endpoint 可变性已消除"换地址烧名额"这一主要消耗源；剩余
   消耗事件 = 真实的新桶启用与桶弃用。产品决策必须以"卷生命周期内的桶变更
@@ -216,14 +231,18 @@ retired  : 全量扫描零引用后进入；仅保留只读+列举供 gc 清残�
 ### 3.4 不变量
 
 - **INV-1（驻留，观测性不变量）**：id 位声明 ref=N 的对象只应存在于桶 N。
-  **违反只报告、永不自动删除**——"同一物理桶被注册为两个 ref"（内外网双地址、
-  DR 拷贝桶等运维形态）会使自动删除演变为 gc 互删清空整桶（第二轮评审
-  S0-1，本设计最初版本的最严重缺陷）。错桶残留只是存储成本，由
-  `gc --report-misplaced` 出清单人工处理。
+  **违反只报告、永不自动删除**。注册查重（§3.2 三层探测）消灭"别名双注册"
+  来源，但堵不住另外两个：① 注册后的人工拷贝（`s3 sync` 误操作/DR 恢复）；
+  ② **bug 把唯一副本写错桶**——"错桶"信号无法区分"多余拷贝"与"写错地方的
+  唯一真身"，自动删除会把可修复的不一致（fsck 拷回正确桶）变成永久丢失。
+  死的错桶对象由泄露规则自然清理（gc 泄露判定与桶无关），"只报告"的集合
+  收窄为**活着的错桶对象**——恰是绝不能删的那部分。清单出口
+  `gc --report-misplaced`，修复出口 fsck heal。
 - **INV-2（可读）**：meta 中存在的 slice，其 id 位声明的桶中必须有**全部
   block**（迁移保留期内的旧副本读取例外，见 INV-6）。
 - **INV-3（注册表身份）**：ref ↔ 逻辑容器绑定不可变；ref 永不复用；同一物理
-  桶严禁多 ref 注册（config 尽力检测规范化 endpoint 指纹）；下线必须走完整
+  桶严禁多 ref 注册（注册时三层探测：指纹快筛 + 主动写探针 + 持久身份标记，
+  见 §3.2；运行期由 gc/fsck 复核身份标记持续检测）；下线必须走完整
   状态机（§3.2），"零引用扫描"单独不构成下线证明。
 - **INV-4（ID 域）**：rawID < 2^56；bit 60-63 恒 0；持久输入校验失败返回
   显式错误。
@@ -638,10 +657,13 @@ func gc() {
             case pending.Contains(id):    skip                    // 首道防线
             case bucketRefOf(id) > maxKnownRef:
                 report(UNKNOWN_REF, obj)             // 持有过期 Format 的 gc 保守跳过（G-5）
-            case bucketRefOf(id) != ref:
-                report(MISPLACED, obj)               // INV-1：只报告不删（S0-1 修订）
             case !liveIDs.Contains(id):
-                delete(obj)                          // 常规泄露：孤儿/已删文件残留
+                delete(obj)                          // 泄露规则先行：死对象无论在哪个桶都清理
+                                                     // （死的错桶副本自动被此规则覆盖，无需特判）
+            case bucketRefOf(id) != ref:
+                report(MISPLACED, obj)               // 走到此处的必然是【活着的】错桶对象：
+                                                     // 可能是"bug 写错桶的唯一副本"——绝不自动删，
+                                                     // 由 fsck heal（拷到正确桶、验证后再清错位副本）
             }
         }
     }
@@ -808,7 +830,7 @@ meta 备份的有效性坍缩到保留期（INV-6 / TrashDays）之内**。运�
 
 | # | 条款 | 落点 | 来源 |
 |---|---|---|---|
-| S0-1 | INV-1 自动删除撤销 → 只报告（`gc --report-misplaced`）；同物理桶多 ref 注册的尽力检测 | §3.4 / §5.7 | 红队独有 |
+| S0-1 | INV-1 自动删除撤销 → 只报告（`gc --report-misplaced`）+ fsck heal；注册查重升级为三层探测（指纹快筛 + 主动写探针 + 持久身份标记，§3.2） | §3.2 / §3.4 / §5.7 | 红队独有；探测协议采纳自决策讨论 |
 | S0-2 | migration reservation（首道防线）+ gc 窗口安全下限（封 `JFS_GC_SKIPPEDTIME` 后门）+ INV-6 独立保留期（脱钩 TrashDays=0 立即删）+ 提交后 Head 自愈 | §3.4 / §5.4 / §5.7 | 双方 |
 | S0-3 | 版本门控两阶段激活（活跃会话版本扫描）；撤回"机制已存在"（`Load(false)` 不复查已证伪） | §7.1 / M-7 | 双方（外部证伪） |
 | S0-4 | key namespace 路由表（`meta/`、`testing/`、`juicefs_uuid` 控制对象恒 ref 0）+ chunk key 解析失败显式报错、绝不回退 ref 0 | §4 | 外部独有 |

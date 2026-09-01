@@ -1,7 +1,8 @@
 # 多桶分层存储设计：sliceID 记桶引用 + Attr 记 tier 策略
 
-> 状态：**第二轮对抗性评审 Request changes（修订已合入正文）**——须完成 §9 全部
-> S0/High 条款并确认 §14 决策记录后，方可冻结位布局进入实现
+> 状态：**ADR-1 四项决策已确认（§14），位布局已冻结**；第二轮对抗性评审条款
+> 已合入正文，进入 Phase 1 实现的剩余前置 = §9 S0 条款实现级闭环 +
+> §11 中 Phase 1 相关未决项（#3/#6/#7）
 > 分支：`multi-bucket-design`
 > 前置阅读：现有单桶分层实现（`Attr.Tier` + `Format.Tiers` + `TierKey` ctx 链路）
 > 评审记录：本文档 §9/§12-14；外部评审 `workdoc/juicefs/评审记录/multi-bucket-tiered-storage-adversarial-review.md`
@@ -40,7 +41,7 @@
 - [11. 开放问题](#11-开放问题)
 - [12. 成本模型与故障域（第二轮评审新增）](#12-成本模型与故障域第二轮评审新增)
 - [13. 备选方案对比（Alternatives）](#13-备选方案对比alternatives)
-- [14. 决策变更记录（ADR-1，待产品确认）](#14-决策变更记录adr-1待产品确认)
+- [14. 决策变更记录（ADR-1，已确认）](#14-决策变更记录adr-1已确认)
 
 ## 1. 背景与目标
 
@@ -62,9 +63,9 @@ storage class，对象 key 只由 sliceID 派生，读取无需感知 tier。
 用户/策略层:  Attr.Tier (uint8, inode 属性, 可变)
                  │  open 时解析一次并快照
                  ▼
-             Format.Tiers[tierID] = {BucketRef, Sc}      ← 可变的策略指针
-                 │
-                 ▼
+             Format.Tiers[tierID] = {BucketRef, Sc}      ← 半可变策略指针（ADR-1.1）：
+                 │                                          Sc 可改；BucketRef 创建后不可改，
+                 ▼                                          换桶 = 新建 tier + 显式迁移
 数据路由层:  sliceID 高位 = BucketRef ──▶ Format.Buckets[ref] = {Storage, Endpoint,
                                             AK/SK(加密), State}
                                             ← 身份（ref↔逻辑容器）恒定；地址/凭证可变；
@@ -171,8 +172,11 @@ type Format struct {
 
 type Tier struct {
     ID        uint8
-    Sc        string // storage class（现有字段）
-    BucketRef uint8  // 新增：指向 Buckets；0 = 默认桶
+    Sc        string // storage class：可修改（成本操作，不影响正确性）
+    BucketRef uint8  // 指向 Buckets；0 = 默认桶。创建后不可修改（ADR-1.1 半可变）：
+                     // 换桶 = 新建 tier + 显式迁移。消除"改指针批量重定向"的
+                     // 误操作爆炸半径（百万文件瞬间 unconverged + 自动搬数据账单）、
+                     // 审计不可追溯（Format 无定义变更历史）与多客户端传播窗口混桶
 }
 ```
 
@@ -318,7 +322,7 @@ placement 一律显式报错，不回退默认值。
 |---|---|---|
 | W-1 | C1、C2 并发写同一文件（各自 open 快照的 tier 不同，例如中间隔了 tier set） | 各自的 slice 打各自的桶位，**都自描述、都可读**。文件暂时混桶，由迁移/compact 收敛。POSIX 对并发写本就不保证内容顺序，此处不引入新语义。 |
 | W-2 | 写入 与 `tier set`（SetAttr 翻转）并发 | 已 open 句柄继续写旧桶（快照），落下的是"旧位但正确"的数据；迁移工具重扫收敛（见 5.4）。**不存在错位数据**（对比文件级方案：attr 已新、数据在旧桶且无从判定）。 |
-| W-3 | 写入 与 tier 定义变更（管理员改 `Tiers[t].BucketRef`）并发 | 句柄快照的是解析后的 bucketRef，且桶**身份**恒定（endpoint/凭证变更对新旧句柄同时生效且安全）⇒ 在写句柄不受影响。新 open 才使用新定义。 |
+| W-3 | 写入 与 tier 定义变更并发 | ADR-1.1 后 tier 的 BucketRef **不可改**，此场景只剩改 Sc：句柄用 open 快照的 sc，新 open 用新值——sc 漂移无害（不影响可读性），fsck 对账。原"改 BucketRef 并发"场景已被半可变决策**结构性消除**。 |
 | W-4 | C1 刚 `config` 加桶并设 tier，C2 的 Format 缓存尚未刷新（OnReload 周期），C2 打开 attr.Tier=新 tier 的文件 | C2 解析失败 → 强制 reload Format 重试 → 仍失败则 **EIO**。规则：宁可失败，绝不静默落错桶。 |
 | W-5 | ID 批分配竞争 | 各客户端独立获取 4096 大小的 rawID 批（现状 `incrCounter("nextChunk")`），打标是本地位或，无新增竞争点。 |
 
@@ -378,9 +382,10 @@ func (s *rSlice) ReadAt(page, off) {
 三种操作，成本递减：
 
 ```text
-op-A 搬桶（bucketRef 变化）   : 数据拷贝 + slice 重写        —— 最贵
-op-B 改 sc（同桶）            : SetAttr + 同 key Copy        —— 便宜（现状 tier set 路径）
-op-C 改 tier 定义             : 纯 Format 变更，零数据操作    —— 免费（新数据走新定义，旧数据可选 op-A 收敛）
+op-A 搬桶（目标 tier 的 BucketRef 不同）: 数据拷贝 + slice 重写   —— 最贵
+op-B 改 sc（同桶不同 tier，或改文件 attr）: SetAttr + 同 key Copy —— 便宜（现状 tier set 路径）
+op-C 改 tier 定义的 Sc 字段              : 纯 Format 变更          —— 免费（批量成本意图变更，
+                                            不影响正确性；BucketRef 不可改，ADR-1.1）
 ```
 
 **op-A 伪代码（核心，已并入第二轮评审修订：reservation / block manifest /
@@ -717,7 +722,7 @@ inode 类型是否受多桶影响，取决于它有没有 slice：
 |---|---|---|---|---|---|---|---|
 | **写入** | POSIX 现状（W-1） | 现状 | W-2/M-2：旧位正确，重扫收敛 | 现状事务重试 | 现状 | G-2 窗口 | W-3/W-4：快照隔离或 EIO |
 | **读取** | — | 无冲突 | R-1：延迟删除窗口 + 失效重读 | 同 R-1（现状语义） | 无冲突 | 无冲突 | R-3：原子交换 |
-| **迁移** | — | — | M-1：Attr CAS 互斥 | M-3：乐观冲突重试 | M-4：ref 计数表达共享 | M-5：小批 + 窗口 | op-C 免费，互不干扰 |
+| **迁移** | — | — | M-1：Attr CAS 互斥 | M-3：乐观冲突重试 | M-4：ref 计数表达共享 | M-5：reservation+窗口 | op-C 仅改 Sc，无数据操作 |
 | **compact** | — | — | — | 现状互斥 | 现状 | 现状窗口 | 快照隔离 |
 | **clone** | — | — | — | — | 现状 | 现状 | 无关 |
 | **gc** | — | — | — | — | — | G-3 幂等 | G-4 retire 协议 |
@@ -754,9 +759,10 @@ inode 类型是否受多桶影响，取决于它有没有 slice：
 ### 7.3 回滚（软单向门）
 
 id 即 key ⇒ 清位 = 换 key = 搬对象。退回单桶 = 把所有非 ref0 数据迁回
-（op-A 全量）。启用第二个桶前必须知情确认。中间降级态：把所有 Tier 的
-BucketRef 改回 0（op-C，免费）——新写全回默认桶，旧数据保读，随重扫迁移
-回流。
+（op-A 全量）。启用第二个桶前必须知情确认。中间降级态（ADR-1.1 半可变下
+BucketRef 不可改，降级走 attr 而非改定义）：对目标目录/文件批量
+`tier set` 到指向 ref0 的 tier（仅 SetAttr 意图变更，不迁数据）——新写全回
+默认桶，旧数据保读，随重扫迁移回流。
 
 **备份有效性坍缩警示**（第二轮评审新增）：meta 备份的可恢复性依赖其引用的
 对象仍然存在。大规模迁移持续删除旧对象 ⇒ 迁移完成后，**早于迁移的全部
@@ -863,8 +869,7 @@ per-bucket/tier 可观测指标与 `tier status` 收敛度量（§12.4）；rena
 
 ## 11. 开放问题
 
-1. BucketRef 位宽最终确认：**注意 16 是终身注册预算而非并存桶数**（§3.2），
-   扩位不可逆——需产品按"卷生命周期桶变更事件总数"拍板（关联 §14）；
+1. ~~BucketRef 位宽~~ **已确认（ADR-1.2）**：4 位，终身 16 名额；
 2. `tier apply` 形态：一次性命令 vs 常驻任务 vs 独立组件（Job 控制面已定为
    Phase 2 必需，此处只剩宿主形态）；
 3. Java/Python SDK 与 gateway 的 Phase 1 支持范围（全量 or 只读）；
@@ -877,8 +882,8 @@ per-bucket/tier 可观测指标与 `tier status` 收敛度量（§12.4）；rena
    倾向维持 + 文档化；
 8. per-bucket 用量统计与配额（跨账号计费必答题，`usedSpace` 现为全局
    计数器）：Phase 2 还是 Phase 3；
-9. 严格排空（generation fence / 短暂拒写）是否为 Phase 2 必需——关联
-   §14 中"迁移是否 fence 写"的原始决策。
+9. ~~严格排空是否 Phase 2 必需~~ **已确认（ADR-1.3）**：迁移不 fence 写，
+   严格排空作为 H-2 后置能力（桶退役 sealed 阶段才必需）。
 
 ## 12. 成本模型与故障域（第二轮评审新增）
 
@@ -945,26 +950,25 @@ atime 抖动数据集上"判冷→迁走→被读→判热→迁回"的每一跳
 元数据依赖，破坏"数据面自治"这一根设计原则。**重评触发条件**：若 §11.1
 的 16 名额预算被产品否决，E 是首选替代路线。
 
-## 14. 决策变更记录（ADR-1，待产品确认）
+## 14. 决策变更记录（ADR-1，已确认）
 
 **变更**：从原《分层存储设计》多桶模型——对外 **4 个不可变 Tier**
 （Tier = Bucket + StorageClass 绑定）、TierID 不复用、sliceID 高 2 位、
-持久 Job + 独立 Worker、inode 迁移 fence——演化为本方案：**可变 Tiers
-策略指针 → 不可变桶注册表**（4 位 BucketRef、tier 数量 256、bucket 与 sc
-分离）、迁移不 fence 写（意图先行 + 重扫收敛）。
+持久 Job + 独立 Worker、inode 迁移 fence——演化为本方案。
 
 **变更动机**：① 分离"便宜的改 sc"（SetAttr+同 key Copy）与"昂贵的搬桶"
 （slice 重写）的成本曲线——原模型改任何 tier 属性都是最贵路径；② tier
-定义可管理（原模型改 tier 的桶需"预留空层级中转"）；③ 新 rawID 消除
+可管理性（原模型改 tier 需"预留空层级中转"）；③ 新 rawID 消除
 ForbidOverwrite 对象层依赖，把双向迁移竞态从"条件写堵漏"变为结构性消失。
 
-**第二轮评审指出这是未经记录的产品模型反转，须逐项重新确认**：
+**四项决策（已逐项确认）**：
 
-1. 对外 tier 是否可变（原：不可变 4 个；现：可变 256 个）；
-2. 桶预算：4 位终身 16 名额是否足够（原：2 位 4 个）；
-3. 迁移是否需要写 fence / 严格排空（原：fence；现：最终收敛 + 可选
-   fence 后置到 H-2）；
-4. 持久 Job + Worker 是 Phase 2 必需还是 Phase 3（本文档已按评审意见
-   前移至 Phase 2 必需，见 §10）。
+| # | 决策点 | 结论 |
+|---|---|---|
+| 1 | 对外 tier 模型 | **半可变策略指针**：`Sc` 可改（成本操作、不影响正确性）；`BucketRef` 创建后**不可改**，换桶 = 新建 tier + 显式迁移。理由：消除全可变的三项代价——误操作爆炸半径（改指针 = 百万文件瞬间 unconverged + 自动搬数据账单）、审计不可追溯（Format 无定义变更历史）、多客户端传播窗口混桶；同时保留相对不可变模型的核心优势（改 sc 便宜、tier 数量 256、endpoint 变更已由注册表可变域承接）。已传播至 §2.1/§3.2/§5.4 op-C/W-3/§7.3 |
+| 2 | sliceID 位宽 | **4 位，终身 16 个注册名额**（明确"名额是消耗品"框架后确认）。位布局冻结 |
+| 3 | 迁移写语义 | **不 fence，最终收敛**：如实显示 unconverged；严格排空（generation fence）后置为桶退役 sealed 阶段的能力（H-2） |
+| 4 | 持久迁移 Job | **Phase 2 必需**（job id / lease / checkpoint / 限速 / 进度） |
 
-**确认前不得冻结 sliceID 位布局。**
+**位布局自本记录确认之日起冻结**；剩余进入实现的前置 = §9 S0 条款的
+实现级闭环 + §11 未决项中标注 Phase 1 相关者（#3、#6、#7）。

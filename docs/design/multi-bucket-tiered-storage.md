@@ -1,8 +1,10 @@
 # 多桶分层存储设计：sliceID 记桶引用 + Attr 记 tier 策略
 
-> 状态：设计评审通过（Request changes 条款已并入本文 §9）
+> 状态：**第二轮对抗性评审 Request changes（修订已合入正文）**——须完成 §9 全部
+> S0/High 条款并确认 §14 决策记录后，方可冻结位布局进入实现
 > 分支：`multi-bucket-design`
 > 前置阅读：现有单桶分层实现（`Attr.Tier` + `Format.Tiers` + `TierKey` ctx 链路）
+> 评审记录：本文档 §9/§12-14；外部评审 `workdoc/juicefs/评审记录/multi-bucket-tiered-storage-adversarial-review.md`
 
 ## 目录
 
@@ -29,13 +31,16 @@
   - [5.10 文件类型语义](#510-文件类型语义)
 - [6. 多客户端并发矩阵（汇总）](#6-多客户端并发矩阵汇总)
 - [7. 兼容性](#7-兼容性)
-  - [7.1 版本门控](#71-版本门控)
+  - [7.1 版本门控（两阶段激活）](#71-版本门控两阶段激活)
   - [7.2 dump/load](#72-dumpload)
   - [7.3 回滚（软单向门）](#73-回滚软单向门)
 - [8. 安全](#8-安全)
-- [9. 评审必须项（并入设计的 Must-fix 条款）](#9-评审必须项并入设计的-must-fix-条款)
+- [9. 评审必须项（两轮合并，Must-fix）](#9-评审必须项两轮合并must-fix)
 - [10. 分期实施](#10-分期实施)
 - [11. 开放问题](#11-开放问题)
+- [12. 成本模型与故障域（第二轮评审新增）](#12-成本模型与故障域第二轮评审新增)
+- [13. 备选方案对比（Alternatives）](#13-备选方案对比alternatives)
+- [14. 决策变更记录（ADR-1，待产品确认）](#14-决策变更记录adr-1待产品确认)
 
 ## 1. 背景与目标
 
@@ -61,7 +66,9 @@ storage class，对象 key 只由 sliceID 派生，读取无需感知 tier。
                  │
                  ▼
 数据路由层:  sliceID 高位 = BucketRef ──▶ Format.Buckets[ref] = {Storage, Endpoint,
-                                            AK/SK(加密), State}   ← 位置标识不可变、只增不删
+                                            AK/SK(加密), State}
+                                            ← 身份（ref↔逻辑容器）恒定；地址/凭证可变；
+                                              ref 只增不复用；下线走状态机（§3.2）
 ```
 
 ### 2.2 设计原则：信息-载体匹配
@@ -97,18 +104,40 @@ bit 0-55  : rawID（nextChunk 计数器域，≈7.2e16，按每秒百万 slice �
 ```go
 const (
     bucketRefShift = 56
-    bucketRefMask  = uint64(0xF) << bucketRefShift
+    bucketRefBits  = 4
+    bucketRefMask  = uint64(1<<bucketRefBits-1) << bucketRefShift // bit 56-59
+    reservedMask   = uint64(0xF) << 60                            // bit 60-63，恒 0
     rawIDMax       = uint64(1) << bucketRefShift
 )
 
-func stampID(rawID uint64, ref uint8) uint64 {
-    assert(rawID < rawIDMax)         // NewSlice 断言，越界直接 panic
-    assert(ref < 16)
-    return rawID | uint64(ref)<<bucketRefShift
+func stampID(rawID uint64, ref uint8) (uint64, error) {
+    if rawID >= rawIDMax || ref >= 1<<bucketRefBits {
+        return 0, fmt.Errorf("slice id space exhausted or invalid ref: raw=%d ref=%d", rawID, ref)
+    }
+    return rawID | uint64(ref)<<bucketRefShift, nil
 }
-func bucketRefOf(id uint64) uint8 { return uint8((id & bucketRefMask) >> bucketRefShift) }
-func rawIDOf(id uint64) uint64    { return id &^ (bucketRefMask | 0xE0<<56) }
+func bucketRefOf(id uint64) uint8 { return uint8(id >> bucketRefShift & (1<<bucketRefBits - 1)) }
+func rawIDOf(id uint64) uint64    { return id & (rawIDMax - 1) }
+func validateID(id uint64) error {
+    if id&reservedMask != 0 { return ErrReservedBits } // 持久输入用显式错误，禁止 panic
+    return nil
+}
 ```
+
+**位域测试向量表**（实现必须包含此表的单元测试）：
+
+| id (hex) | rawID | ref | 合法性 |
+|---|---|---|---|
+| `0x0000_0000_0000_0001` | 1 | 0 | 合法（存量数据形态） |
+| `0x0100_0000_0000_0001` | 1 | 1 | 合法 |
+| `0x0F00_0000_0000_002A` | 42 | 15 | 合法 |
+| `0x1000_0000_0000_0001` | — | — | 非法（bit 60 保留位被置位） |
+| `0x8000_0000_0000_0001` | — | — | 非法（bit 63，PG 有符号溢出） |
+
+> 修正记录：初版 `rawIDOf` 掩码 `0xE0<<56` 漏清 bit 60（两轮对抗性评审均命中）。
+> 现以 `rawIDMax-1` 取低位从构造上消除整类错误；一切来自持久介质的输入
+> （dump/load、对象 key 解析、计数器）校验失败返回显式错误，panic 仅允许用于
+> 进程内已验证的不变量。
 
 守恒校验（三处）：
 
@@ -121,17 +150,22 @@ func rawIDOf(id uint64) uint64    { return id &^ (bucketRefMask | 0xE0<<56) }
 
 ```go
 type Bucket struct {
-    Ref       uint8  // 注册表下标，永不复用
-    Storage   string // "s3"/"oss"/"gs"...   ┐
-    Endpoint  string // bucket URL           ┤ 位置标识：不可变
-    AccessKey string //                      ┐
-    SecretKey string // 落库前必须加密        ┤ 凭证/参数：可变（支持轮换）
-    State     string // active | retired     ← 删除只允许 retire，ref 永不复用
+    Ref       uint8  // 注册表下标：只增、永不复用（终身预算，见下）
+    // 身份（不可变）：ref ↔ 逻辑容器的绑定关系。同一物理桶严禁注册为两个 ref
+    //（INV-1 别名互删风险，S0-1）；config 时对规范化 endpoint 指纹做尽力检测。
+    // 地址与凭证（可变）：运维现实要求 endpoint 可换（内外网切换、云厂商域名
+    // 弃用、自建存储迁址）、凭证可轮换。路由查注册表实时内容，地址变更对新旧
+    // 句柄同时生效且安全——只要仍指向同一逻辑容器。
+    Storage   string
+    Endpoint  string
+    AccessKey string
+    SecretKey string // 落库加密（防护等级的诚实评估见 §8）
+    State     string // active → draining → sealed → retired（状态机见下）
 }
 
 type Format struct {
     // ...现有字段...
-    Buckets map[uint8]Bucket // ref 0 = 默认桶（等价现有 Storage/Bucket/AK/SK 字段）
+    Buckets map[uint8]Bucket // ref 1-15；ref 0 由旧字段虚拟合成（见下）
     Tiers   map[uint8]Tier   // 现有结构扩展
 }
 
@@ -142,10 +176,28 @@ type Tier struct {
 }
 ```
 
+**桶生命周期状态机**（第二轮评审 H-2：`active|retired` 两态无法关闭旧句柄
+并发写入的窗口）：
+
+```text
+active   : 正常读写
+draining : Tiers 不得再指向该 ref；禁止新 open 快照该桶；存量句柄可继续写
+sealed   : 禁止任何新 PUT 与新元数据引用；等待旧句柄 / staging 回放 / 迁移
+           reservation 全部排空（按 session 枚举验证）；存量数据仍可读
+retired  : 全量扫描零引用后进入；仅保留只读+列举供 gc 清残；凭证永久失效时
+           转 tombstone（放弃列举，残留对象按最后一次清单人工处理，
+           gc/fsck 跳过并告警而非挂死）
+```
+
+- **ref 0 的唯一权威来源**：ref 0 永远由现有 `Storage/Bucket/AccessKey/
+  SecretKey` 字段**虚拟合成，不写入 Buckets map**。load/config 时若发现
+  ref 0 实体项 → 显式拒绝（消除双重权威来源，第二轮评审 Medium）。
+- **16 个 ref 是卷的终身注册预算，不是并存桶数**：ref 不复用 ⇒ 每次 retire
+  永久消耗名额。endpoint 可变性已消除"换地址烧名额"这一主要消耗源；剩余
+  消耗事件 = 真实的新桶启用与桶弃用。产品决策必须以"卷生命周期内的桶变更
+  事件总数"评估位宽（§11 开放问题 1，§14 ADR 待确认项）。
 - `Format.Encrypt/Decrypt` **必须**扩展遍历 `Buckets[].AccessKey/SecretKey`
   （现状只处理三个固定字段）；三引擎 dump 的 `keepSecret` 脱敏同步扩展。
-- ref 0 的 Bucket 项由现有 `Storage/Bucket/AccessKey/SecretKey` 字段合成，
-  保证单桶卷的 Format 不发生任何变化（老卷零感知）。
 
 ### 3.3 Attr.Tier 语义
 
@@ -158,38 +210,66 @@ type Tier struct {
 
 ### 3.4 不变量
 
-- **INV-1（驻留）**：id 位声明 ref=N 的对象，只允许存在于桶 N；
-  出现在其他桶 = 泄露，可删。
-- **INV-2（可读）**：meta 中存在的 slice，其 id 位声明的桶中必须有对应
-  block（延迟删除窗口内例外，同现状 compact 语义）。
-- **INV-3（注册表）**：Buckets 的位置标识（Storage/Endpoint）一经创建不可变；
-  ref 永不复用；retire 前必须经全量扫描证明零引用。
-- **INV-4（ID 域）**：rawID < 2^56；bit 60-63 恒 0。
-- **INV-5（GC 窗口）**：任何"对象已 PUT、meta 未提交"状态的持续时间必须
-  远小于 gc 的 mtime 保护窗口（现状 1h）。
+- **INV-1（驻留，观测性不变量）**：id 位声明 ref=N 的对象只应存在于桶 N。
+  **违反只报告、永不自动删除**——"同一物理桶被注册为两个 ref"（内外网双地址、
+  DR 拷贝桶等运维形态）会使自动删除演变为 gc 互删清空整桶（第二轮评审
+  S0-1，本设计最初版本的最严重缺陷）。错桶残留只是存储成本，由
+  `gc --report-misplaced` 出清单人工处理。
+- **INV-2（可读）**：meta 中存在的 slice，其 id 位声明的桶中必须有**全部
+  block**（迁移保留期内的旧副本读取例外，见 INV-6）。
+- **INV-3（注册表身份）**：ref ↔ 逻辑容器绑定不可变；ref 永不复用；同一物理
+  桶严禁多 ref 注册（config 尽力检测规范化 endpoint 指纹）；下线必须走完整
+  状态机（§3.2），"零引用扫描"单独不构成下线证明。
+- **INV-4（ID 域）**：rawID < 2^56；bit 60-63 恒 0；持久输入校验失败返回
+  显式错误。
+- **INV-5（迁移在途双重保护）**：迁移新对象在 meta 提交前必须受两道保护：
+  ① **migration reservation**（首个 PUT 前在 meta 登记、带过期时间，gc 视为
+  pending-live——首道防线，机制性）；② gc mtime 窗口（默认 1h，
+  `JFS_GC_SKIPPEDTIME` 有强制安全下限——第二道防线，缓冲性）。
+  **窗口是缓冲不是正确性边界**（第二轮评审 S0-2：纯窗口方案存在
+  check-then-commit TOCTOU，且窗口可被环境变量缩小）。
+- **INV-6（迁移保留期）**：迁移导致 ref 归零的旧对象必须进入**独立保留队列**，
+  保留期 = max(TrashDays, 迁移最小保留期 24h)，**不随 TrashDays=0 立即物理
+  删除**（现状 compact 在 TrashDays=0 时立即删，迁移不得沿用）；迁移事务
+  提交后须 Head 验证新对象存在，缺失则趁旧副本仍在保留期内重拷自愈。
 
 ## 4. 存储层
 
 ```go
 // 替换现有 initStorageTiers 装饰器，构建于 Buckets 之上（与 Tiers 解耦）
 type bucketRouter struct {
-    stores [16]ObjectStorage // 按 ref 索引；每项 = prefix(name+"/") 包装的实例
+    stores [16]atomic.Pointer[ObjectStorage] // 凭证轮换/endpoint 变更时原子换实例
 }
-
-func (r *bucketRouter) route(key string) ObjectStorage {
-    return r.stores[bucketRefOf(parseSliceID(key))]
-}
-// Get/Put/Head/Delete/Restore: route(key).Xxx(...)
-// Put/Copy 额外从 ctx TierKey 取 sc（现状机制不变）
-// ListAll: 对所有 active/retired 桶做堆式 k 路归并（同 sharding.go 实现）
 ```
+
+**Key namespace 路由表**（第二轮评审 S0-4：同一 storage 还承载非 chunk
+对象——`meta/*` 元数据自动备份 vfs/backup.go:134、`testing/*` 连通性测试
+cmd/format.go:377、`juicefs_uuid`——对任意 key 做 parseSliceID 是错误的）：
+
+| key 前缀 | 路由 |
+|---|---|
+| `chunks/...` | 解析 slice id → 按高位 ref 路由；**解析失败 = 显式错误，绝不回退 ref 0** |
+| `meta/`、`testing/`、`juicefs_uuid` 等控制对象 | 恒 ref 0（canonical 桶） |
+
+**完整 ObjectStorage 契约**（Phase 1 设计细化项）：router 必须定义全接口
+语义——`List`/multipart（`CreateMultipartUpload/ListUploads/...`）/`Limits`/
+`Copy`/`Shutdown`：`Copy` 仅允许同 ref（跨 ref 归迁移原语）；multipart 按
+key 路由到单桶；`Limits` 取各桶交集；`Shutdown` 广播；任何方法的部分失败
+必须上抛而非吞掉。
+
+**gc/fsck/destroy 不做全局 k 路归并**（第二轮评审 H-5）：逐桶独立扫描、
+独立 checkpoint、独立成功/失败报告——现状 sharding 归并对单桶 List 错误
+**无限重试**（sharding.go:147-152）且任一子桶失败即整体失败，一个 retired
+桶凭证过期会挂死全部工具。没有任何调用者真正需要全局有序流。
 
 装饰器顺序：`encrypted( bucketRouter{ ref→prefix(blob) } )`。
 卷级 `Compression`/`EncryptKey` 全局统一，跨桶数据格式一致。
 
-**Reload 拆分**（现状对任何 Tiers 变化整体重建 storage）：
+**Reload 拆分**（现状对任何 Tiers 变化整体重建 storage；且 mount.go:486 的
+`holder.ObjectStorage = newBlob` 是**非原子字段赋值——既有数据竞争，列为
+本设计的前置修复**）：
 
-- Buckets 新增 / 凭证变更 → 只重建对应 ref 的 storage 实例（`atomic.Pointer` 交换）；
+- Buckets 新增 / 凭证或地址变更 → 只重建对应 ref 的 storage 实例（原子交换）；
 - Tiers 变更 → 只替换策略映射，**不触碰 router**（在写句柄不受影响的根基）。
 
 ## 5. 场景流程、伪代码与多客户端并发分析
@@ -218,12 +298,19 @@ func (s *sliceWriter) flush() {
     rawID := meta.NewSlice()                     // 4096 批分配，客户端本地
     s.id = stampID(rawID, s.h.bucketRef)         // ← 打标点：首个 PUT 之前
     for indx, block := range s.blocks {
-        ctx := WithValue(ctx, TierKey{}, s.h.sc) // sc 走瞬时载体
+        ctx := WithValue(ctx, PlacementKey{}, placement{s.h.bucketRef, s.h.sc})
         router.Put(ctx, key(s.id, indx, len), block) // 桶由 key 中 id 位决定
     }
-    meta.Write(inode, chunkIdx, slice{id: s.id, ...}) // meta 提交（含 sliceRef+1）
+    meta.Write(inode, chunkIdx, slice{id: s.id, ...}) // meta 提交（含 sliceRef 登记）
 }
 ```
+
+**Placement snapshot 与 TierKey 契约**（第二轮评审 H-1）：现状 `TierKey` ctx
+只接受 `uint8` tier id，且未知值**静默回退 tiers[0]**
+（object_storage.go `getRuntimeTier`）——与本设计"绝不静默落错"原则直接冲突。
+因此**不重载 TierKey 的类型语义**，新增独立的
+`PlacementKey{BucketRef uint8; Sc string}` ctx 类型；对象层收到未知/缺失
+placement 一律显式报错，不回退默认值。
 
 **多客户端并发分析（写）**
 
@@ -231,7 +318,7 @@ func (s *sliceWriter) flush() {
 |---|---|---|
 | W-1 | C1、C2 并发写同一文件（各自 open 快照的 tier 不同，例如中间隔了 tier set） | 各自的 slice 打各自的桶位，**都自描述、都可读**。文件暂时混桶，由迁移/compact 收敛。POSIX 对并发写本就不保证内容顺序，此处不引入新语义。 |
 | W-2 | 写入 与 `tier set`（SetAttr 翻转）并发 | 已 open 句柄继续写旧桶（快照），落下的是"旧位但正确"的数据；迁移工具重扫收敛（见 5.4）。**不存在错位数据**（对比文件级方案：attr 已新、数据在旧桶且无从判定）。 |
-| W-3 | 写入 与 tier 定义变更（管理员改 `Tiers[t].BucketRef`）并发 | 句柄快照的是解析后的 bucketRef，且注册表项不可变 ⇒ 在写句柄不受影响。新 open 才使用新定义。 |
+| W-3 | 写入 与 tier 定义变更（管理员改 `Tiers[t].BucketRef`）并发 | 句柄快照的是解析后的 bucketRef，且桶**身份**恒定（endpoint/凭证变更对新旧句柄同时生效且安全）⇒ 在写句柄不受影响。新 open 才使用新定义。 |
 | W-4 | C1 刚 `config` 加桶并设 tier，C2 的 Format 缓存尚未刷新（OnReload 周期），C2 打开 attr.Tier=新 tier 的文件 | C2 解析失败 → 强制 reload Format 重试 → 仍失败则 **EIO**。规则：宁可失败，绝不静默落错桶。 |
 | W-5 | ID 批分配竞争 | 各客户端独立获取 4096 大小的 rawID 批（现状 `incrCounter("nextChunk")`），打标是本地位或，无新增竞争点。 |
 
@@ -241,13 +328,19 @@ func (s *sliceWriter) flush() {
 func (s *wSlice) upload(indx) {
     key := key(s.id, indx, blen)          // 打标 id 已在 key 中 → 桶信息已持久化在文件名里
     if writeback {
-        bcache.stage(key, data, footer{sc: s.h.sc}) // footer 只需存 sc 快照
+        bcache.stage(key, data, footer{bucketRef: s.h.bucketRef, sc: s.h.sc})
         // 上传（立即或延迟）：
         //   桶：key 中 id 位自路由（重启回放 scanStaging 同样成立）
         //   sc：读 footer（写入时刻的意图快照，不受 tier 定义后续变更影响）
     }
 }
 ```
+
+**staging footer schema 迁移**（第二轮评审 H-1）：现状 footer 只有
+`Tier uint8`（disk_cache_file.go），回放时二次解析可变的 Tiers 定义——与
+快照原则冲突。新 schema 为 `{BucketRef uint8, Sc string}`（msgpack 向后
+兼容：读到只含 Tier 字段的旧 footer 时，按启动时 Format 解析一次并告警；
+未知 tier → 该 staged 块报错滞留、人工处理，不静默回退）。
 
 **并发分析（writeback）**
 
@@ -290,49 +383,78 @@ op-B 改 sc（同桶）            : SetAttr + 同 key Copy        —— 便宜
 op-C 改 tier 定义             : 纯 Format 变更，零数据操作    —— 免费（新数据走新定义，旧数据可选 op-A 收敛）
 ```
 
-**op-A 伪代码（核心）**：
+**op-A 伪代码（核心，已并入第二轮评审修订：reservation / block manifest /
+ref 计数约定 / 共享去重 / 保留队列 / Head 自愈）**：
 
 ```go
 func migrateFile(inode, dstTier) error {
-    // 1. 意图先行：CAS 翻转 Attr（新写入立刻走新桶；并发迁移互斥的锚点）
+    // 1. 意图先行：CAS 翻转 Attr（并发迁移意图串行化的锚点）
     if !meta.SetAttrCAS(inode, expectTier=curTier, newTier=dstTier) {
         return ErrConflict // 另一个迁移已改意图，本工具退出
     }
     dst := format.Tiers[dstTier]
+    dedup := map[uint64]uint64{}                  // 会话级 oldID→newID 共享去重（§5.5）
 
     for each chunk of inode {
         slices := meta.ReadChunk(inode, chunkIdx)
-        for batch := range batches(slices, 64) {      // 小批：约束 INV-5（GC 窗口）
+        for batch := range batches(slices, batchSize) {
+            // 2. reservation：首个 PUT 之前登记（INV-5 首道防线，gc 视为 pending-live）
+            resv := meta.AddReservation(inode, expire=2h)
             for s := range batch {
-                if bucketRefOf(s.id) == dst.BucketRef { continue } // 幂等：已在目标桶
-                newID := stampID(meta.NewSlice(), dst.BucketRef)   // 全新身份，永不碰撞
-                data, err := router.Get(key(s.id, ...))            // 逐对象
-                if err == ENOENT { skip }                          // S-1：staged 未上传，下轮再迁
-                router.Put(ctx{sc: dst.Sc}, key(newID, ...), data) // 无需 ForbidOverwrite：新 key 全局唯一
-                rewrites = append(rewrites, {old: s.id, new: newID})
+                if bucketRefOf(s.id) == dst.BucketRef { continue }  // 幂等：已在目标桶
+                newID, seen := dedup[s.id]
+                if !seen {
+                    newID = stampID(meta.NewSlice(), dst.BucketRef) // 全新身份，永不碰撞
+                    // 3. 完整 block manifest 复制 + 校验（S0-5）：
+                    //    一个 slice 是多个 block 对象（key(id, indx, blockSize)），
+                    //    必须全部复制并逐块校验 size/checksum 后才允许换 ID——
+                    //    半拷贝 + 整体切换 = 文件不可读
+                    for indx := range blockManifest(s) {
+                        data, err := srcBlob.Get(key(s.id, indx, ...))
+                        if err == ENOENT { skipSlice }              // S-1：staged 未上传，下轮再迁
+                        dstBlob.Put(ctx{placement{dst.BucketRef, dst.Sc}}, key(newID, indx, ...), data)
+                    }
+                    verifyManifest(newID, s)                        // 逐块 Head 校验 size
+                    resv.Add(newID)
+                    dedup[s.id] = newID
+                }
+                rewrites = append(rewrites, {old: s.id, new: newID, entries: entriesOf(s)})
             }
-            // 2. 每批立即提交（PUT→提交窗口 << 1h，满足 INV-5）
+            // 4. 每批立即提交（小批仍是好实践，但正确性由 reservation 保证而非窗口）
             err := meta.Txn(func(tx) {
                 if tx.GetAttr(inode).Tier != dstTier { // 防乒乓：意图已被并发迁移改写
                     return ErrSuperseded               // 整个迁移终止，让位给新意图
                 }
                 cur := tx.ReadChunk(inode, chunkIdx)
-                if !containsAll(cur, rewrites.old) {   // 乐观并发：chunk 被并发写/compact 改过
-                    return ErrRetry                    // 整批重读重试（新对象成孤儿，交给 gc）
+                if !matchEntries(cur, rewrites) {      // 逐条目匹配（含同 id 多条目，H-3）
+                    return ErrRetry                    // 整批重读重试（新对象由 reservation 过期后转孤儿）
                 }
-                tx.ReplaceSliceIDs(chunkIdx, rewrites) // 24 字节等长原位替换
+                tx.ReplaceSliceEntries(chunkIdx, rewrites) // 按条目位置等长替换，非按 id 全局替换
                 for r := range rewrites {
-                    tx.SliceRef(r.new, +1)
-                    tx.SliceRef(r.old, -1)             // 归零 → 进 delslices 延迟删除（自路由）
+                    // ref 计数遵守各引擎原生约定（H-3）：Redis 存储值 = refs-1，
+                    // 新 id 首条目 HSet "0"，多条目每条 +1；SQL/TKV 按各自约定。
+                    tx.InitOrIncrSliceRef(r.new, r.entries)
+                    tx.DecrSliceRef(r.old, r.entries)
+                    // 归零 → 进迁移保留队列（INV-6）：保留期 max(TrashDays, 24h)，
+                    // 不随 TrashDays=0 立即物理删除
                 }
+                tx.ConsumeReservation(resv)
             })
+            headVerify(rewrites.new) // 5. 提交后抽验（INV-6 自愈钩子）：新对象缺失
+                                     //    → 旧副本仍在保留队列 → 立即重拷 + 修复
         }
     }
-    // 3. 收敛检查：迁移期间的并发新写（W-2）可能又落了旧桶
+    // 6. 收敛检查：迁移期间的并发新写（W-2）可能又落了旧桶
     if !converged(inode, dst.BucketRef) { rescan(inode) } // 重扫直到收敛或达到重试上限
     return nil
 }
 ```
+
+> **CopyFileRange 同 id 多条目警示（H-3）**：同一 slice id 可在同一/相邻 chunk
+> 出现多个条目（不同 off/len，redis.go:3260-3274 按条目 RPush 且逐条目 ref+1）。
+> `ReplaceSliceEntries` 必须按**条目位置**替换并按条目数增减 ref；若按 id 全局
+> 替换而 ref 只 ±1，会过量递减、**提前删除仍被 clone 引用的对象**。三引擎共享
+> 测试必须包含"同 id 多条目 + clone 引用"向量。
 
 **无锁对象层的删除安全原则**：对象存储没有锁与事务，因此本设计规定**对象层
 永远不承载决策**——迁移工具没有"删除"步骤，删除只能是 meta 事务内 ref 归零
@@ -340,8 +462,10 @@ func migrateFile(inode, dstTier) error {
 ① 新对象 key 含全新 rawID（计数器原子分配、永不复用），无人知晓、无从同名
 互删；② 解引用它的事务必须先"看见"它并已把数据以更新的身份复制走
 （copy-then-swap 顺序）；③ 唯一不受事务保护的窗口（PUT 后、meta 提交前的
-孤儿态）由 gc 的 mtime 窗口（1h）+ 小批提交（INV-5）保护——该假设与现有
-正常写入路径完全同构。
+孤儿态）由 **migration reservation（机制，首道）+ gc mtime 窗口（缓冲，
+第二道）** 双重保护——纯窗口方案已被第二轮评审证明不足（TOCTOU +
+`JFS_GC_SKIPPEDTIME` 后门 + TrashDays=0 立即删旧副本的三重叠加存在真实
+丢数据路径），reservation 与 INV-6 保留期把"约定"升级为"机制 + 自愈"。
 
 **推演：双向并发迁移（原方案丢数据场景在 D 下的对照）**
 
@@ -377,12 +501,12 @@ A:     后续批次事务校验：chunk 已不含 A 要替换的 id → 失败
 | 编号 | 场景 | 行为与结论 |
 |---|---|---|
 | M-1 | C1、C2 对同一文件并发 `tier set`（不同目标） | Attr CAS 串行化**意图翻转**，但注意：后发 CAS 以新的当前值为期望（expect=t2, set=t1）依然成功，故两个迁移的重写阶段**可以短暂同时活跃**。安全性不依赖互斥，而依赖：① 每份物理副本 id 唯一（新 rawID，key 永不复用，不存在同名互删）；② 删除不是工具的动作，只是事务内 ref 归零的延迟副作用——解引用一个 id 的事务必然已把数据以新身份复制走；③ **每批事务内校验 attr==本迁移目标**（伪代码 `ErrSuperseded`），后发意图使先发迁移在下一批立即终止，乒乓最多一批、只浪费不丢失。**原设计文档中"双向迁移互删所有副本"的场景结构性消失**。 |
-| M-2 | 迁移 与 并发写同文件 | 写走 Attr 新值（open 晚于 CAS）或旧快照（open 早于 CAS，落旧桶）。后者由第 3 步重扫收敛；重扫仍不净的（长期打开的写句柄）由 compact 最终收敛（compact 用当前 attr.Tier）。 |
+| M-2 | 迁移 与 并发写同文件 | 写走 Attr 新值（open 晚于 CAS）或旧快照（open 早于 CAS，落旧桶）。后者由第 6 步重扫收敛；**重扫仍不净的（长期打开的写句柄）没有自动收敛保证**——compact 只处理 `len(compacted)≥2` 的 chunk（base.go:2865），顺序写规整文件与追加型文件永不触发。语义必须二分：**最终策略**（如实显示 unconverged，不声称完成）与**严格排空**（需 generation fence/短暂拒写，见 §9 H-2，能力后置）。 |
 | M-3 | 迁移 与 compact 同 chunk | 两者都在事务内做 chunk 原位替换 → 乐观冲突，一方 `ErrRetry`。compact 产物已带新桶位（attr 已翻转）→ 迁移重读后发现位正确，跳过。无死锁、无丢失。 |
 | M-4 | 迁移 与 clone | clone 在事务内复制 slice 引用并 ref+1。若 clone 先行：迁移 ref-1 后旧 id ref 仍 >0 → **不删旧对象**，clone 文件继续可读（代价：两桶各一份，与原设计文档"clone 变两份数据，可接受"结论一致）。若迁移先行：clone 拿到的已是新 id。引擎事务保证两者串行化。 |
-| M-5 | 迁移 与 GC | 批内"PUT 已成、meta 未提交"的新对象对 gc 是孤儿 → 依赖 mtime 窗口（1h）保护。**设计约束**：单批从首个 PUT 到提交必须 << 1h（batch=64 + 提交超时告警）；提交前发现批内对象 mtime 陈旧则重新 PUT 刷新。 |
-| M-6 | 迁移工具自身多实例（如两台机器跑 `tier apply`） | 同 M-1，Attr CAS 天然互斥到文件粒度；目录级任务用分片（按 inode 取模）避免无谓冲突。 |
-| M-7 | 迁移 与 老客户端 | 不可能并存：启用第二个桶时 `MinClientVersion` 已抬升，老客户端在 `Load` Format 时被 `CheckVersion` 拒绝（机制已存在）。 |
+| M-5 | 迁移 与 GC | **双重保护**（INV-5）：reservation 使 gc 将在途新对象视为 pending-live（机制）；mtime 窗口为第二道缓冲。窗口不可单独依赖：check-then-commit 存在 TOCTOU（检查后工具挂起 → gc 删 → 提交），`JFS_GC_SKIPPEDTIME` 可缩窗口，跨云慢链路/限流/长尾重试都可击穿时间假设。提交后 Head 抽验 + INV-6 保留期提供最后自愈。 |
+| M-6 | 迁移工具自身多实例（如两台机器跑 `tier apply`） | 同 M-1，Attr CAS 天然互斥到文件粒度；目录级任务用分片（按 inode 取模）避免无谓冲突。**持久 Job 控制面（job id/lease/checkpoint/限速/进度）为 Phase 2 必需**（第二轮评审 H-6），进程内重扫不足以支撑 TB 级跨云迁移的断点与多实例协作。 |
+| M-7 | 迁移 与 老客户端 | **修正（第二轮评审 S0-3 证伪初版表述）**：`CheckVersion` 只在挂载时 `Load(true)` 执行；已挂载老客户端心跳走 `Load(false)`，只查 MetaVersion/UUID、**不复查 MinClientVersion**（base.go:914-925），且会静默丢弃 Buckets 字段继续运行——老二进制无法 retrofit。**两阶段激活**（§7.1）：抬版本后必须扫描活跃会话的客户端版本清单，存在低版本会话则拒绝创建非 0 BucketRef 并列出待驱逐会话；启用后的新挂载由 Load(true) 拒绝。 |
 
 **硬链接的迁移语义**：迁移的操作对象是 inode 而非路径，故 N 个链接**同时生效、
 天然原子**——tier 在 inode 上只有一个值、slice 只有一组，不存在"链接间层级
@@ -487,27 +611,35 @@ func compactChunk(inode, chunkIdx, tierID) {
 ```
 
 **并发分析（compact）**：与迁移的冲突见 M-3；与写入的冲突为现状既有语义
-（事务重试）。**compact 是混桶文件的免费收敛器**：频繁改写的文件即使从未
-显式迁移，数据也会随 compact 流向 Attr 当前指向的桶。
+（事务重试）。**compact 是机会性收敛器，不是保证**（第二轮评审修正）：仅当
+chunk 内 `len(compacted) ≥ 2` 才触发（base.go:2865）——顺序写规整文件
+（每 chunk 单 slice）与追加型文件永不 compact，其混桶状态只能靠重扫迁移
+收敛。"免费收敛"仅对碎片化写入成立，M-2 的兜底表述已同步修正。
 
 ### 5.7 GC
 
 ```go
 func gc() {
-    maxMtime := now - 1h                          // 现状窗口（INV-5 的另一半）
-    liveIDs := meta.ScanSlices()                  // 打标 id 全集（opaque 透传）
-    for ref, blob := range router.buckets {       // 含 retired 桶
-        for obj := range blob.ListAll("chunks/") {
-            if obj.Mtime > maxMtime { skip }      // 保护未提交的写入/迁移
-            id := parseSliceID(obj.Key)
+    window := max(configuredWindow, minSafeWindow)   // JFS_GC_SKIPPEDTIME 有强制安全下限
+    liveIDs := meta.ScanSlices()                     // 打标 id 全集（opaque 透传）
+    pending := meta.ListReservations()               // 迁移在途新 id：pending-live（INV-5）
+    for ref, blob := range router.buckets {          // 逐桶独立扫描/独立 checkpoint/独立报告
+        for obj := range blob.ListAll("chunks/") {   // 单桶失败只影响该桶，不挂死全局
+            if obj.Mtime > now-window { skip }       // 第二道缓冲
+            id, err := parseSliceID(obj.Key)
+            if err != nil { report(UNPARSEABLE, obj); continue } // 不删
             switch {
+            case pending.Contains(id):    skip                    // 首道防线
+            case bucketRefOf(id) > maxKnownRef:
+                report(UNKNOWN_REF, obj)             // 持有过期 Format 的 gc 保守跳过（G-5）
             case bucketRefOf(id) != ref:
-                delete(obj)                       // INV-1：错桶残留（理论上仅 bug/手工产生）
+                report(MISPLACED, obj)               // INV-1：只报告不删（S0-1 修订）
             case !liveIDs.Contains(id):
-                delete(obj)                       // 常规泄露：迁移/写入中断的孤儿、已删文件残留
+                delete(obj)                          // 常规泄露：孤儿/已删文件残留
             }
         }
     }
+    expireReservations()                             // 过期 reservation 的对象转常规孤儿，下轮清
 }
 ```
 
@@ -515,10 +647,11 @@ func gc() {
 
 | 编号 | 场景 | 行为与结论 |
 |---|---|---|
-| G-1 | gc 与 迁移并发 | 见 M-5：窗口 + 小批提交。窗口内的孤儿下轮 gc 清理。 |
-| G-2 | gc 与 写入并发 | 现状既有语义（PUT→meta 提交秒级窗口 << 1h），多桶不改变假设。 |
-| G-3 | 两个 gc 并发 | 删除幂等；`ListAll` 归并只读。与现状一致。 |
-| G-4 | gc 与 桶 retire | retired 桶仍被扫描（清理残留），零引用证明由连续 N 轮 gc 零命中给出，之后才允许下线。 |
+| G-1 | gc 与 迁移并发 | 见 M-5：reservation（机制）+ 窗口（缓冲）双重保护；过期 reservation 的对象转常规孤儿下轮清理。 |
+| G-2 | gc 与 写入并发 | 现状既有语义（PUT→meta 提交秒级窗口 << 窗口下限），多桶不改变假设。 |
+| G-3 | 两个 gc 并发 | 删除幂等；逐桶扫描只读。与现状一致。 |
+| G-4 | gc 与 桶 retire | retired 桶仍被扫描清残；零引用证明 = 状态机 sealed 排空 + 连续 N 轮 gc 零命中（缺一不可，见 §3.2）；凭证永久失效 → tombstone，gc 跳过并告警而非无限重试挂死。 |
+| G-5 | gc 持有过期 Format（不认识新 ref） | id 高位 > 已知最大 ref → 保守跳过并报告，绝不按"错桶/孤儿"删除；处理前先强制 reload Format。 |
 
 ### 5.8 Fsck
 
@@ -555,7 +688,9 @@ func fsck(inode) {
 | F-4 | 写入：PUT 成功、meta Write 未提交崩溃 | 孤儿对象 | 现状语义，gc 清理（窗口保护内不误删） |
 | F-5 | writeback：meta 已提交、staged 未上传崩溃 | slice 存在、对象不在（INV-2 暂缺口） | 重启 `scanStaging` 回放（key 自路由）；盘损则数据丢失——**writeback 的既有风险，多桶不放大** |
 | F-6 | `config` 加桶/改 tier 中途（Format 写入是单事务） | Format 要么旧要么新 | 无中间态；传播延迟场景见 W-4 |
-| F-7 | SetAttr 已翻、迁移完全没跑 | 纯"意图未收敛" | `tier status` 可见；新写已走新桶；重跑或等 compact |
+| F-7 | SetAttr 已翻、迁移完全没跑 | 纯"意图未收敛" | `tier status` 可见；新写已走新桶；重跑或等重扫（compact 只对碎片化 chunk 兜底，见 §5.6） |
+| F-8 | 新对象在窗口被击穿后遭 gc 误删、事务已提交 | chunk 指向缺失对象 | 提交后 Head 抽验发现 → 旧副本仍在迁移保留队列（INV-6，不随 TrashDays=0 消失）→ 重拷自愈；fsck 亦可检出并走同一修复 |
+| F-9 | 桶 draining/sealed 阶段崩溃 | 状态机持久于 Format，无中间态 | 重启后按状态继续排空；sealed 拒新写由全部客户端依据 Format 共同强制 |
 
 **恢复设计的总原则**：所有中断态都落在"自描述、可读、可幂等重跑"的安全域内；
 唯一需要主动补救的只有孤儿对象（gc 兜底）。不存在需要人工判断"数据到底在哪"
@@ -593,14 +728,21 @@ inode 类型是否受多桶影响，取决于它有没有 slice：
 
 ## 7. 兼容性
 
-### 7.1 版本门控
+### 7.1 版本门控（两阶段激活）
 
-- 单桶卷（Buckets 只有 ref 0、所有 Tier 的 BucketRef=0）：行为与现状**完全一致**，
-  不抬版本；
-- `config` 首次新增第二个 Bucket 时：强制 `MinClientVersion` 抬升（机制沿用
-  `cmd/config.go` 现有 requireMinClientVersion 流程），老客户端在 `Load` 时被
-  `CheckVersion` 拒绝——**语义不兼容（老客户端读多桶数据必 404）只能挡在门外，
-  不能兼容**。
+- 单桶卷（无 Buckets 实体项、所有 Tier 的 BucketRef=0）：行为与现状**完全
+  一致**，不抬版本；
+- **已证伪的初版假设**（第二轮评审 S0-3）：`CheckVersion` 只在挂载时
+  `Load(true)` 执行，已挂载老客户端心跳走 `Load(false)` **不复查版本**
+  （base.go:914-925），并会静默丢弃不认识的 Buckets 字段继续运行——
+  "抬版本自动挡住所有老客户端"不成立，老二进制无法 retrofit；
+- **两阶段激活协议**：
+  1. Phase A：`config` 抬升 `MinClientVersion` → 此后新挂载被 `Load(true)`
+     拒绝；随后扫描**活跃会话的客户端版本清单**（session 记录含版本），
+     存在低版本会话 → 拒绝进入 Phase B 并列出待处理会话，由运维升级/驱逐；
+  2. Phase B：低版本会话清零后，才允许 `config` 创建 Buckets 实体项与
+     非 0 BucketRef 的 Tier——此后系统内不可能存在读不懂多桶数据的客户端。
+- 语义不兼容（老客户端读多桶数据必 404）只能挡在门外，不能兼容。
 
 ### 7.2 dump/load
 
@@ -613,62 +755,216 @@ inode 类型是否受多桶影响，取决于它有没有 slice：
 
 id 即 key ⇒ 清位 = 换 key = 搬对象。退回单桶 = 把所有非 ref0 数据迁回
 （op-A 全量）。启用第二个桶前必须知情确认。中间降级态：把所有 Tier 的
-BucketRef 改回 0（op-C，免费）——新写全回默认桶，旧数据保读，随 compact
-自然回流。
+BucketRef 改回 0（op-C，免费）——新写全回默认桶，旧数据保读，随重扫迁移
+回流。
+
+**备份有效性坍缩警示**（第二轮评审新增）：meta 备份的可恢复性依赖其引用的
+对象仍然存在。大规模迁移持续删除旧对象 ⇒ 迁移完成后，**早于迁移的全部
+meta 备份的有效性坍缩到保留期（INV-6 / TrashDays）之内**。运维军规：大规模
+迁移完成后立即产出新的 meta 备份；恢复演练必须包含对象层引用完整性校验
+（fsck）。DR 细化见 §12.5。
 
 ## 8. 安全
 
-- Buckets 凭证纳入 `Format.Encrypt/Decrypt`（§3.2，Critical 条款）；
-- dump `keepSecret=false` 时脱敏全部桶凭证；
-- 凭证轮换 = 注册表可变域操作（INV-3），reload 原子交换实例；
-- 跨账号最小权限：每桶凭证只需该桶的读写删权限；gc/fsck 需全桶列举权限，
-  文档注明。
+**威胁模型的诚实评估**（第二轮评审）：`Format.Encrypt` 的密钥派生自卷 UUID，
+而 UUID 与密文同存于 Format（config.go:237）——**防护等级 = 防误看，不防任何
+能读取 Format 的攻击者（自解密信封）**。多桶把 N 朵云的长期凭证放入同一个
+信封：任一客户端主机/进程沦陷 = 全部云账号桶凭证沦陷。这不是新引入的漏洞，
+是把既有弱点乘以 N——部署方必须显式接受该风险或采用下述缓解。
 
-## 9. 评审必须项（并入设计的 Must-fix 条款）
+- Buckets 凭证纳入 `Format.Encrypt/Decrypt` 与 dump `keepSecret` 脱敏
+  （防误看层面的必做项，§3.2）；
+- 凭证轮换 = 注册表可变域操作，reload 原子交换实例（§4）；
+- 跨账号最小权限：每桶凭证只授予该桶读写删；gc/fsck 需列举权限，文档注明；
+- **缓解方向（开放问题 §11.6）**：短期凭证/STS/instance role；凭证引用
+  （Format 只存引用，客户端从本地文件/KMS 解引用）；按角色分权（普通客户端
+  不持删除与全桶列举权限，gc/迁移 worker 使用独立身份）。
 
-| 级别 | 条款 | 落点 |
+## 9. 评审必须项（两轮合并，Must-fix）
+
+第一轮（设计者自审 + 红队）与第二轮（独立外部评审）合并去重后的完整清单。
+**S0 全部闭环前不得进入 Phase 1 实现；位布局在 §14 决策确认前不得冻结。**
+
+**S0（丢数据 / 根基级）**
+
+| # | 条款 | 落点 | 来源 |
+|---|---|---|---|
+| S0-1 | INV-1 自动删除撤销 → 只报告（`gc --report-misplaced`）；同物理桶多 ref 注册的尽力检测 | §3.4 / §5.7 | 红队独有 |
+| S0-2 | migration reservation（首道防线）+ gc 窗口安全下限（封 `JFS_GC_SKIPPEDTIME` 后门）+ INV-6 独立保留期（脱钩 TrashDays=0 立即删）+ 提交后 Head 自愈 | §3.4 / §5.4 / §5.7 | 双方 |
+| S0-3 | 版本门控两阶段激活（活跃会话版本扫描）；撤回"机制已存在"（`Load(false)` 不复查已证伪） | §7.1 / M-7 | 双方（外部证伪） |
+| S0-4 | key namespace 路由表（`meta/`、`testing/`、`juicefs_uuid` 控制对象恒 ref 0）+ chunk key 解析失败显式报错、绝不回退 ref 0 | §4 | 外部独有 |
+| S0-5 | 迁移单元 = 完整 block manifest：全部 block 复制 + 逐块校验后才允许 CAS 换 ID | §5.4 | 外部独有 |
+
+**High**
+
+| # | 条款 | 落点 |
 |---|---|---|
-| Critical | 位段避开 bit63；三处 ID 域守恒校验；PG uint64 边界回归测试 | §3.1 |
-| Critical | 桶凭证加密 + dump 脱敏全覆盖 | §3.2 / §8 |
-| High | 迁移小批提交，PUT→提交窗口 << gc 1h 窗口；陈旧重 PUT | §5.4 M-5 / INV-5 |
-| High | 三引擎 slice 重写事务统一语义（乐观冲突整批重试、幂等断点）+ 共享测试 | §5.4 |
-| High | 入口适配验收清单：mount / gateway / webdav / sync(jfs://) / Java SDK / gc / fsck / destroy / config 连通测试 / `vfs.CalcObjects`；key 派生四处复制先收敛为单一函数 | §10 Phase 1 |
-| High | 注册表可变域精确化：位置不可变、凭证可变、删除仅 retire | §3.2 / INV-3 |
-| Medium | Reload 拆分（Buckets 重建实例 / Tiers 只换映射）+ atomic.Pointer | §4 |
-| Medium | 挂载参数 `--storage-class` 覆盖 Tier0 的语义废弃（保留告警）；解除 config 的 tier×bucket 互斥拦截；Shards 与多桶 format 时互斥 | §10 Phase 1 |
-| Medium | 回滚知情确认 + 降级态文档 | §7.3 |
+| H-1 | `PlacementKey{BucketRef, Sc}` 替代 TierKey 类型重载（现状未知值静默回退 tiers[0]）；staging footer schema 扩展 + 旧 footer 兼容规则 | §5.1 / §5.2 |
+| H-2 | 桶生命周期状态机 `active→draining→sealed→retired(→tombstone)`；"最终策略 vs 严格排空"语义二分，严格排空需 generation fence | §3.2 / M-2 |
+| H-3 | `ReplaceSliceEntries` 按条目位置语义 + 各引擎原生 ref 计数约定（Redis 存储值=refs-1）+ 同 id 多条目（CopyFileRange）测试向量 | §5.4 |
+| H-4 | 三引擎 slice 重写事务统一语义（乐观冲突整批重试、幂等断点）+ 共享测试 | §5.4 |
+| H-5 | gc/fsck/destroy 放弃全局 k 路归并 → 逐桶独立扫描/checkpoint/报告；List 错误上抛（现状无限重试） | §4 / §5.7 |
+| H-6 | 持久迁移 Job 控制面（job id / lease / checkpoint / 限速 / 进度 / 失败清单）前移至 Phase 2 | §10 |
+| H-7 | 入口适配验收清单（mount/gateway/webdav/sync-jfs/Java SDK/gc/fsck/destroy/config/`vfs.CalcObjects`）+ ObjectStorage 全接口多桶语义 + key 派生四处复制收敛 | §4 / §10 |
+| H-8 | 成本模型与滞回：同云 server-side copy 快路径、auto 规则冷却期/预算上限、迁移缓存失效预警 | §12 |
+
+**Medium**
+
+位段避 bit63 + 位域测试向量表（§3.1）；PG uint64 边界回归；凭证加密+脱敏
+覆盖（§3.2/§8）；ref 0 唯一权威来源（§3.2）；Reload 拆分 + atomic.Pointer
+（含现存竞态前置修复，§4）；`--storage-class` 挂载参数废弃告警、config
+tier×bucket 互斥解除、Shards 互斥；回滚知情确认 + 备份军规（§7.3）；
+per-bucket/tier 可观测指标与 `tier status` 收敛度量（§12.4）；rename 语义
+决策（§11.7）；panic → 显式错误（§3.1）；JSON dump id 超 2^53 的外部工具
+精度告警（§7.2 注记）。
 
 ## 10. 分期实施
 
+**Phase 0（前置门槛）**：§9 全部 S0 条款的设计细化 + §14 决策确认 →
+位布局冻结评审。
+
 **Phase 1 数据格式与路由**（完成后：目录继承写入不同桶即可用）
 
-1. key 派生收敛为单一函数（4 处复制点）；
-2. 位布局 + 打标（`prepareID`）+ 三处守恒校验；
-3. Format Buckets/Tiers schema + 加密/脱敏 + config 命令（加桶、改 tier 定义）；
-4. bucketRouter + ListAll 归并 + Reload 拆分；
-5. 读/写/staging/compact/delete 路由贯通（多为零改动验证）；
-6. gc / fsck / destroy / info 多桶适配；
-7. 版本门控 + Shards 互斥 + 老参数处理；
-8. 测试：三引擎共享测试、dump/load round-trip、PG 边界、混合版本拒载、
-   加密 round-trip、gc/fsck 泄露注入。
+1. key 派生收敛为单一函数（4 处复制点）+ 位域测试向量表；
+2. 位布局 + 打标（`prepareID`）+ 三处守恒校验（显式错误）；
+3. Format Buckets/Tiers schema（含状态机字段、ref 0 虚拟合成）+ 加密/脱敏
+   + config 命令（加桶、改 tier 定义、两阶段激活的会话版本扫描）；
+4. bucketRouter：key namespace 路由表 + `PlacementKey` + ObjectStorage 全
+   接口语义 + 逐桶独立扫描 + Reload 拆分（含 atomic.Pointer 前置修复）；
+5. 读/写/staging（新 footer schema）/compact/delete 路由贯通；
+6. gc（MISPLACED/UNKNOWN_REF 只报告、reservation 感知、窗口下限）/ fsck /
+   destroy / info 多桶适配；
+7. 版本门控两阶段激活 + Shards 互斥 + `--storage-class` 废弃告警；
+8. 测试：三引擎共享测试、dump/load round-trip（含计数器域与 ref 存在性校验）、
+   PG 边界、混合版本（含已挂载老客户端行为）、加密 round-trip、
+   gc 泄露/错桶/过期 Format 注入。
 
 **Phase 2 迁移**
 
-1. op-A 原语（Attr CAS + 小批事务 + 幂等断点 + 收敛重扫）；
-2. `tier set`（op-A/op-B 自动选路）+ `tier status`（收敛度量）；
-3. 冷冻层级前置（Head 检测 → restore → 重试）；
-4. 测试：迁移 × 写 × compact × clone × gc 交叉、中断注入（F-1~F-7）。
+1. op-A 原语：Attr CAS + reservation + block manifest 复制校验 + 按条目
+   替换与引擎原生 ref 约定 + 会话去重映射 + 迁移保留队列（INV-6）+
+   提交后 Head 自愈；
+2. **持久 Job 控制面**（H-6）：job id / lease / inode+chunk checkpoint /
+   限速与并发预算 / 进度与失败清单——TB 级跨云迁移的断点与多实例协作
+   不能依赖进程内重扫；
+3. `tier set`（op-A/op-B 自动选路，同云同账号走 server-side copy 快路径）
+   + `tier status`（意图 vs 现实收敛度量）；
+4. 冷冻层级前置（Head 检测 → restore → 重试）；
+5. 桶状态机 draining/sealed 执行面（新 open 拒绝、sealed 拒写）；
+6. 测试：迁移 × 写 × compact × clone × gc 交叉、中断注入（F-1~F-9）、
+   同 id 多条目向量、reservation 过期路径。
 
 **Phase 3 策略自动化**
 
-1. tier 定义 CRUD 完整化（op-C）+ retire 协议；
-2. `tier apply` 后台规则引擎（path/size/atime → tier），限速、断点、分片。
+1. tier 定义 CRUD 完整化（op-C）+ retire/tombstone 全流程工具；
+2. `tier apply` 后台规则引擎（path/size/atime → tier）：**滞回与冷却期、
+   每日迁移预算上限**（§12.3）、断点、分片；
+3. 凭证分发增强（STS/引用/分权，视 §11.6 决策）。
 
 ## 11. 开放问题
 
-1. BucketRef 位宽最终确认：4 位（16 桶）是否满足远期？扩位不可逆，需产品拍板；
-2. `tier apply` 形态：一次性命令 vs 常驻任务 vs 独立组件；
+1. BucketRef 位宽最终确认：**注意 16 是终身注册预算而非并存桶数**（§3.2），
+   扩位不可逆——需产品按"卷生命周期桶变更事件总数"拍板（关联 §14）；
+2. `tier apply` 形态：一次性命令 vs 常驻任务 vs 独立组件（Job 控制面已定为
+   Phase 2 必需，此处只剩宿主形态）；
 3. Java/Python SDK 与 gateway 的 Phase 1 支持范围（全量 or 只读）；
-4. retire 桶的"连续 N 轮 gc 零命中"中 N 的取值与操作流程；
-5. 归档桶直写的成本策略：是否提供 `write-through-class`（先写 STANDARD，
-   桶内生命周期转归档）作为 tier 定义可选项。
+4. retire 的 N 值、sealed 排空的验证手段与 tombstone 的人工处理清单格式；
+5. 归档桶直写的成本策略：是否提供 `write-through-class`；
+6. 凭证分发模型：自解密信封是否可接受（§8），STS/凭证引用/角色分权的
+   优先级与形态；
+7. rename 语义：`mv` 跨 tier 目录不重继承（现状 inode 属性语义）是否维持——
+   维持则 path 规则引擎必须有滞回防反复搬运；改变则违反 POSIX 直觉，
+   倾向维持 + 文档化；
+8. per-bucket 用量统计与配额（跨账号计费必答题，`usedSpace` 现为全局
+   计数器）：Phase 2 还是 Phase 3；
+9. 严格排空（generation fence / 短暂拒写）是否为 Phase 2 必需——关联
+   §14 中"迁移是否 fence 写"的原始决策。
+
+## 12. 成本模型与故障域（第二轮评审新增）
+
+### 12.1 op-A 成本量化
+
+10TB 文件 = 2.6M 个 4MB block 对象。跨云迁移一次性成本：egress ≈ **$900+**
+（按 $0.09/GB）+ 2.6M GET + 2.6M PUT 请求费 + meta 数万批事务；源为归档层
+另加解冻费与小时级等待。**同云同账号必须走 server-side copy 快路径**：对象层
+新增可选 `CopyFrom(srcRef, key)` 接口（S3 CopyObject 类语义），免 egress、
+免数据过客户端——这是 op-A 在同云场景从"贵"降到"请求费"的关键优化（H-8）。
+
+### 12.2 迁移的缓存失效成本
+
+op-A 换 id ⇒ 该文件在**全部客户端**的本地磁盘缓存整体作废，读流量转移到
+更冷（可能需解冻）的目标桶——大规模迁移需配套 warmup 或迁移限速窗口。
+op-B（同 key Copy）缓存保活。这是两种操作被低估的隐藏成本差，`tier set`
+文档必须向用户呈现。
+
+### 12.3 自动规则滞回（防乒乓账单）
+
+atime 抖动数据集上"判冷→迁走→被读→判热→迁回"的每一跳都是真实账单。
+`tier apply` 必须内置：**冷却期**（同文件两次 op-A 最小间隔）、**不对称
+滞回阈值**（如降冷 atime>90d / 回热 atime<7d）、**预算上限**（每日迁移
+字节数/请求数/费用上限，超限暂停并告警）。无滞回的规则引擎不允许发布。
+
+### 12.4 故障域与可观测性
+
+单桶：桶挂 = 全挂，诊断平凡。多桶：任一桶挂 = **部分文件/部分 chunk 不可
+读，表象与真丢块相同**。要求：
+
+- per-bucket 健康探测与独立指标（请求率/错误率/延迟/字节，沿用
+  storage_class label 先例扩展 bucket label）；
+- fsck/读路径区分"桶不可达"（EIO + 桶标识）与 BROKEN（对象确实缺失）；
+- 降级语义：单桶不可达只影响引用它的文件，不得演变为全卷故障；
+- `tier status` 输出：per tier 的 desired vs actual 字节与 slice 数、
+  未收敛清单、迁移 Job 进度/失败分类、staging 最大滞留时长、
+  reservation 存量与年龄、retire blocker 列表。
+
+### 12.5 备份 / DR
+
+多桶无全局时间点快照：恢复 = meta(T) + **每个桶**在 T 之后未删除 meta(T)
+所引用的对象。迁移持续删除旧对象 ⇒ 历史 meta 备份有效性坍缩到保留期内
+（§7.3 军规：大迁移后立即重做 meta 备份）。Phase 2 交付物需包含：跨云
+恢复时序文档、逐桶恢复清单工具、恢复后 fsck 引用完整性校验流程。
+
+## 13. 备选方案对比（Alternatives）
+
+设计演化中比较过的方案（详细推演见评审对话记录）：
+
+| 方案 | 核心 | 结论 |
+|---|---|---|
+| A. 文件级 Attr 路由 | bucket+sc 合并存 Attr，读靠 attr 贯通 + 404 兜底 | 否决：clone/删除/GC 正确性靠修补件拼装；writeback footer 过期有丢数据路径 |
+| B. sliceID 高位记 桶+类 | tier=bucket+sc 编码进 id 高 2 位 | 否决：改 sc 也要全量重写 slice；2 位=4 组合封死 |
+| C. sliceID 记桶、Attr 记类 | 维度分离，无 tier 抽象 | D 的子集：正确性同 D，但用户直面两维、无策略层 |
+| **D. 本方案** | C + 一维 tier 策略层 + 桶注册表 | 采纳（附 §9 条款） |
+| E. 稀疏 id→bucket 映射表 | 只记迁移过的 slice（默认桶免记录），id/key 不变 | **未充分评估**（第二轮评审指出），见下 |
+
+**方案 E 的诚实对比**：迁移不换 key ⇒ **本地缓存保活**（消解 §12.2）、
+**无 key 固化**（endpoint/桶数彻底自由，消解 16 预算与 S0-1 别名问题）、
+无位宽契约。代价：读路径引入一次映射查询（可客户端缓存，miss→404→回查
+兜底）；删除/gc 需 join 映射表；**同 key 跨桶复制重新引入双向迁移互删竞态**
+（正是本方案用"新 rawID"消灭的那一类），需 (id,bucket) 元组删除队列 +
+事务化驻留记录另行闭环，复杂度与 reservation 相当。落选理由：读路径引入
+元数据依赖，破坏"数据面自治"这一根设计原则。**重评触发条件**：若 §11.1
+的 16 名额预算被产品否决，E 是首选替代路线。
+
+## 14. 决策变更记录（ADR-1，待产品确认）
+
+**变更**：从原《分层存储设计》多桶模型——对外 **4 个不可变 Tier**
+（Tier = Bucket + StorageClass 绑定）、TierID 不复用、sliceID 高 2 位、
+持久 Job + 独立 Worker、inode 迁移 fence——演化为本方案：**可变 Tiers
+策略指针 → 不可变桶注册表**（4 位 BucketRef、tier 数量 256、bucket 与 sc
+分离）、迁移不 fence 写（意图先行 + 重扫收敛）。
+
+**变更动机**：① 分离"便宜的改 sc"（SetAttr+同 key Copy）与"昂贵的搬桶"
+（slice 重写）的成本曲线——原模型改任何 tier 属性都是最贵路径；② tier
+定义可管理（原模型改 tier 的桶需"预留空层级中转"）；③ 新 rawID 消除
+ForbidOverwrite 对象层依赖，把双向迁移竞态从"条件写堵漏"变为结构性消失。
+
+**第二轮评审指出这是未经记录的产品模型反转，须逐项重新确认**：
+
+1. 对外 tier 是否可变（原：不可变 4 个；现：可变 256 个）；
+2. 桶预算：4 位终身 16 名额是否足够（原：2 位 4 个）；
+3. 迁移是否需要写 fence / 严格排空（原：fence；现：最终收敛 + 可选
+   fence 后置到 H-2）；
+4. 持久 Job + Worker 是 Phase 2 必需还是 Phase 3（本文档已按评审意见
+   前移至 Phase 2 必需，见 §10）。
+
+**确认前不得冻结 sliceID 位布局。**

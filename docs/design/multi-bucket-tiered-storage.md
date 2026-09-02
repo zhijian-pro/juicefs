@@ -1,11 +1,15 @@
 # 多桶分层存储设计：sliceID 记桶引用 + Attr 记 tier 策略
 
-> 状态：**ADR-1 四项 + 开放问题 8 项决策已确认（§11/§14），位布局已冻结**；
-> 第二轮对抗性评审条款已合入正文。进入 Phase 1 的剩余前置 = §9 S0 条款
-> 实现级闭环（唯一未决：§11.4 retire 参数，Phase 2 细化时定）
+> 状态：**三轮对抗性评审全部闭环**（第二轮 + 第三轮并行三份：codex/glm53/
+> fable5，处置表见 §9）；ADR-1 四项 + 开放问题 8 项 + 第三轮方向性决策四组
+> （桶身份 IdentityUUID、持久性假设与退役取消、heal 字节比较、激活软门+轮换）
+> 均已确认，位布局已冻结。唯一未决：§11.4 retire 参数（Phase 2 细化时定）。
+> 下一步 = Phase 1 实现。
 > 分支：`multi-bucket-design`
 > 前置阅读：现有单桶分层实现（`Attr.Tier` + `Format.Tiers` + `TierKey` ctx 链路）
-> 评审记录：本文档 §9/§12-14；外部评审 `workdoc/juicefs/评审记录/multi-bucket-tiered-storage-adversarial-review.md`
+> 评审记录：本文档 §9/§12-14；外部评审三份见
+> `workdoc/juicefs/评审记录/multi-bucket-round3-review-*.md`（另有第二轮
+> multi-bucket-tiered-storage-adversarial-review.md）
 
 ## 目录
 
@@ -37,7 +41,7 @@
   - [7.3 回滚（软单向门）](#73-回滚软单向门)
   - [7.4 上线 runbook（灰度顺序）](#74-上线-runbook灰度顺序)
 - [8. 安全](#8-安全)
-- [9. 评审必须项（两轮合并，Must-fix）](#9-评审必须项两轮合并must-fix)
+- [9. 评审必须项（全轮次合并，Must-fix）](#9-评审必须项全轮次合并must-fix)
 - [10. 分期实施](#10-分期实施)
 - [11. 开放问题（决策进展）](#11-开放问题决策进展)
 - [12. 成本模型与故障域（第二轮评审新增）](#12-成本模型与故障域第二轮评审新增)
@@ -992,7 +996,7 @@ inode 类型是否受多桶影响，取决于它有没有 slice：
 | FIFO/设备/socket | 无 | Tier 惰性继承，无影响 |
 | Trash 文件 | 保留 inode+slices | 过期删除走 sliceRef 归零 → 自路由（同 F-3） |
 | 内部虚拟文件（`.stats` 等） | 无 | 无影响 |
-| 迁移暂存 holder（detached，内部） | 持 slice 条目作"引用保活" | 用户不可见；角色 flag，compact 豁免；gc 视其条目为普通活引用（INV-5 载体）；fsck 特判（§5.8）；批级短命，崩溃遗留由现有 detached 清理回收 |
+| 迁移暂存 holder（detached 目录 + pin 页文件，内部） | 页文件持 slice 条目作"引用保活" | 用户不可见；角色 flag，compact 豁免；gc 视其条目为普通活引用（INV-5 载体）；fsck 特判（§5.8）；页随批建删（分钟级），Job root 心跳防误收；崩溃遗留经 detached 清理 emptyDir→逐页 unlink→ref 递减回收 |
 
 ## 6. 多客户端并发矩阵（汇总）
 
@@ -1138,7 +1142,7 @@ meta 备份的有效性坍缩到删除延迟（TrashDays）之内**。运维军�
   Y 写）——与普通客户端的最小权限模型分开描述、分开发放；"只碰热数据的
   客户端可不配冷桶凭证"的裁剪仅适用于普通客户端。
 
-## 9. 评审必须项（两轮合并，Must-fix）
+## 9. 评审必须项（全轮次合并，Must-fix）
 
 第一轮（设计者自审 + 红队）与第二轮（独立外部评审）合并去重后的完整清单。
 **S0 全部闭环前不得进入 Phase 1 实现；位布局在 §14 决策确认前不得冻结。**

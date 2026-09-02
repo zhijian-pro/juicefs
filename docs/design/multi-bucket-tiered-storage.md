@@ -645,7 +645,7 @@ A:     后续批次事务校验：chunk 已不含 A 要替换的 id → 失败
 | M-4 | 迁移 与 clone | clone 在事务内复制 slice 引用并 ref+1。若 clone 先行：迁移 ref-1 后旧 id ref 仍 >0 → **不删旧对象**，clone 文件继续可读（代价：两桶各一份，与原设计文档"clone 变两份数据，可接受"结论一致）。若迁移先行：clone 拿到的已是新 id。引擎事务保证两者串行化。 |
 | M-5 | 迁移 与 GC | **在途副本被暂存 holder 引用（INV-5）——对 gc 是普通活对象，gc 对迁移零感知、零特判**。保护基于引用而非时间：工具挂起再久也不失保护；暂存到期清理后僵尸提交被 swap 事务的 StagingHolds 校验拦下。gc 删除候选执行前逐个点查 meta 复核（S0-6 修复）。旧对象删除与 compact 同构（TrashDays 语义）。 |
 | M-6 | 迁移工具自身多实例（如两台机器跑 `tier apply`） | 同 M-1，Attr CAS 天然互斥到文件粒度；目录级任务用分片（按 inode 取模）避免无谓冲突。**持久 Job 控制面（job id/lease/checkpoint/限速/进度）为 Phase 2 必需**（第二轮评审 H-6），进程内重扫不足以支撑 TB 级跨云迁移的断点与多实例协作。 |
-| M-7 | 迁移 与 老客户端 | **修正（第二轮评审 S0-3 证伪初版表述）**：`CheckVersion` 只在挂载时 `Load(true)` 执行；已挂载老客户端心跳走 `Load(false)`，只查 MetaVersion/UUID、**不复查 MinClientVersion**（base.go:914-925），且会静默丢弃 Buckets 字段继续运行——老二进制无法 retrofit。**两阶段激活**（§7.1）：抬版本后必须扫描活跃会话的客户端版本清单，存在低版本会话则拒绝创建非 0 BucketRef 并列出待驱逐会话；启用后的新挂载由 Load(true) 拒绝。 |
+| M-7 | 迁移 与 老客户端 | **第三轮再修正**：session 扫描存在三个盲区（Load→NewSession 窗口、NoSession/ReadOnly 不登记、过期 session 复活），meta 侧无法保证挡住已运行的老二进制。但残留老客户端**无数据损坏路径**（写落默认桶自洽、读 404 自身 EIO、删除 no-op）——危害 = 放置漂移。软门（版本+等待周期+session 扫描）强制，凭证轮换硬围栏为推荐项（§7.1）。 |
 
 **硬链接的迁移语义**：迁移的操作对象是 inode 而非路径，故 N 个链接**同时生效、
 天然原子**——tier 在 inode 上只有一个值、slice 只有一组，不存在"链接间层级
@@ -910,21 +910,33 @@ inode 类型是否受多桶影响，取决于它有没有 slice：
 
 ## 7. 兼容性
 
-### 7.1 版本门控（两阶段激活）
+### 7.1 版本门控（两阶段激活，第三轮修正）
 
 - 单桶卷（无 Buckets 实体项、所有 Tier 的 BucketRef=0）：行为与现状**完全
   一致**，不抬版本；
-- **已证伪的初版假设**（第二轮评审 S0-3）：`CheckVersion` 只在挂载时
-  `Load(true)` 执行，已挂载老客户端心跳走 `Load(false)` **不复查版本**
-  （base.go:914-925），并会静默丢弃不认识的 Buckets 字段继续运行——
-  "抬版本自动挡住所有老客户端"不成立，老二进制无法 retrofit；
-- **两阶段激活协议**：
-  1. Phase A：`config` 抬升 `MinClientVersion` → 此后新挂载被 `Load(true)`
-     拒绝；随后扫描**活跃会话的客户端版本清单**（session 记录含版本），
-     存在低版本会话 → 拒绝进入 Phase B 并列出待处理会话，由运维升级/驱逐；
-  2. Phase B：低版本会话清零后，才允许 `config` 创建 Buckets 实体项与
-     非 0 BucketRef 的 Tier——此后系统内不可能存在读不懂多桶数据的客户端。
-- 语义不兼容（老客户端读多桶数据必 404）只能挡在门外，不能兼容。
+- **两次被证伪的假设，如实记录**：
+  - 第二轮：`CheckVersion` 只在挂载时 `Load(true)` 执行，心跳 `Load(false)`
+    不复查（base.go:914-925）——"抬版本自动挡住已挂载老客户端"不成立；
+  - 第三轮：**"session 清零 ⇒ 系统内不存在老客户端"也不成立**，三个盲区
+    （均已验证）：① 老客户端停在 Load(true) 与 NewSession 之间的窗口；
+    ② NoSession 模式 Java SDK 与 ReadOnly 客户端根本不登记 session；
+    ③ 过期被清的 session 会随老进程心跳恢复而复活。
+    **结论：meta 侧任何机制都无法保证挡住已运行的老二进制**——老代码
+    不认识新门，这是逻辑死路而非实现缺陷。
+- **残留老客户端的危害定性（第三轮，关键修正）**：写入落默认桶（id 高位=0，
+  自洽可读，仅放置漂移）；读打标数据 404 → 自身 EIO；compact 读 404 中止；
+  删除误路由 → no-op 仅泄露。**没有任何路径通向数据损坏**——门失效的代价
+  是漂移与老客户端自身不可用，严重度为产品语义级而非丢数据级。
+- **两阶段激活协议（软门，强制）**：
+  1. Phase A：`config` 抬升 `MinClientVersion` → 新挂载被拒；等待 ≥ 一个
+     完整 heartbeat + session 过期周期；扫描活跃会话版本清单，存在低版本
+     会话 → 拒绝进入 Phase B 并列出；runbook 显式点名清单的不可见项
+     （NoSession SDK / ReadOnly / 暂停中的进程）；
+  2. Phase B：软门全绿后允许创建 Buckets 实体项与非 0 BucketRef 的 Tier。
+- **硬围栏（推荐项，用户决策）**：凭证轮换——凭证本地化模式（决策 #6）下，
+  新凭证只分发给已升级客户端，轮换默认桶凭证 ⇒ 未升级二进制立即失去对象
+  存储访问，覆盖全部三个盲区（包括不碰 meta 的进程）。部署方按合规要求
+  选择是否执行；执行后残留客户端清零。
 
 ### 7.2 dump/load
 
@@ -952,7 +964,9 @@ meta 备份的有效性坍缩到删除延迟（TrashDays）之内**。运维军�
 ```text
 1. 全量客户端升级到多桶版本
      ——此刻行为零变化：单桶卷 Format 不变、id 高位全 0
-2. config 抬 MinClientVersion → 确认活跃会话清单全绿（Phase A）
+2. config 抬 MinClientVersion → 等待一个完整 heartbeat+session 过期周期
+   → 会话清单全绿（注意清单盲区：NoSession SDK/ReadOnly/暂停进程，§7.1）
+   → 推荐执行凭证轮换硬围栏（残留清零）
 3. 注册第二个桶（三层探针验证）→ 定义新 tier（Phase B）
 4. 试点目录 tier set（仅改意图）→ 新写落新桶，观察 per-bucket 指标
 5. 试点单文件迁移 → fsck 校验 → 再试点目录迁移

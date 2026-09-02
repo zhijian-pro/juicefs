@@ -170,6 +170,8 @@ type Bucket struct {
     SecretKey string // 凭证文件 / instance role），凭证不入 meta（决策 #6）；
                      // 非空 = 信封便利模式（落库加密，防护等级见 §8）
     State     string // active → draining → sealed → retired（状态机见下）
+    IdentityUUID string // 注册时生成；与桶内 bucket_id 对象内容活体一致 = 身份
+                        //（注册/改址/跨桶删除决策的比对基准，第三轮 S0-1 修订）
 }
 
 type Format struct {
@@ -205,23 +207,40 @@ retired  : 全量扫描零引用后进入；仅保留只读+列举供 gc 清残�
   SecretKey` 字段**虚拟合成，不写入 Buckets map**。load/config 时若发现
   ref 0 实体项 → 显式拒绝（消除双重权威来源，第二轮评审 Medium）。
 
-**注册与地址变更的配置事务协议**（S0-1 预防手段；所有配置进入点都有守门，
-运行期无需巡逻）：
+**注册与地址变更的配置事务协议**（第三轮评审 S0-1 修订，身份方案采纳自
+决策讨论：**身份 = 注册表 IdentityUUID 与桶内 bucket_id 内容的活体一致**。
+同一物理桶对同一 key 只可能返回一种内容 ⇒ 内容比对即身份判定）：
 
 ```text
-注册新桶 ref=N（config 事务，前置全部通过才写 Format）：
-1. 指纹快筛：规范化 endpoint（scheme/host/bucket 名）比对，免费先挡低级重复
-2. 主动探针：向新桶写 <name>/probe_<random> → 对所有已注册桶 Head 同 key
-   → 任一可见 = 同一物理桶（写入透过两个地址可见）→ 拒绝；随后删除探针。
-   不受地址形态影响（内外网/CNAME/IP/path-style 全覆盖）
-3. 持久身份标记：写 <name>/bucket_id = {volumeUUID, ref, 注册时间}
-   → 注册时新桶已存在本卷 bucket_id（其他 ref）= 别名或既有桶的拷贝 → 拒绝
-     （主动探针抓不到"注册前拷贝"，标记可以）
+Bucket 注册表项含 IdentityUUID 字段；桶内对象 <name>/bucket_id 的内容
+必须与之相等。
 
-变更 ref=N 的 endpoint/凭证（config 事务）：
-   前置条件 = 经【新地址/新凭证】读到匹配的 bucket_id（卷 UUID + ref=N 一致）
-   → 不匹配/读不到：拒绝写入 Format
-   ⇒ 错误地址根本进不了注册表，客户端无条件信任注册表（§4 结构性预防之二）
+注册新桶 ref=N（config 事务）：
+1. 指纹快筛：规范化 endpoint 比对（免费预检，挡低级重复）
+2. 读新桶 bucket_id：
+   ├─ 内容 == 任一已注册 ref 的 UUID → 拒绝
+   │    （同一物理桶换地址来注册 / 既有桶的拷贝——两种都该拒）
+   ├─ 内容为陌生 UUID → 拒绝并提示（失败注册的残留 / 他卷拷贝，先人工清理）
+   └─ 不存在 → 继续
+3. 写入全新 UUID_N
+4. Format 以单调 generation 做 CAS 提交
+   （现状 config 为"Load 整份 → Init 整份覆盖写"，需改造为 CAS——
+    消灭并发注册互相覆盖）
+5. 提交后回读 bucket_id 仍 == UUID_N；不等（被并发注册者覆盖）
+   → CAS 回滚本次注册并重试
+   ——并发注册者最终恰好一个干净胜出，无需对象层条件写接口
+
+变更 ref=N 的 endpoint / 凭证（config 事务）：
+   经新地址读 bucket_id → 内容 == 注册表记录的 UUID_N → 接受；否则拒绝
+   ├─ 覆盖"同桶换地址"
+   └─ 也覆盖"完整拷贝后切换"（合法的桶级 DR 迁移）：切换后自动触发
+      fsck 校验引用完整性，拷贝不完整则报 BROKEN 清单，旧桶未动可回退
+
+运行期活体互异校验（heal / 退役等一切跨桶删除决策的前置，§5.7）：
+   经 X 实例读 bucket_id == UUID_X 且 经 Y 实例读 == UUID_Y
+   ⇒ X、Y 物理互异（同一个桶无法同时等于两个不同的 UUID）
+   任一不成立 → fail-safe 中止 + 告警
+   （带外篡改 bucket_id 的后果 = 修复功能失能，绝不是误删）
 ```
 - **8 个 ref 是卷的终身注册预算，不是并存桶数**（ADR-1.2）：ref 不复用 ⇒
   每次 retire 永久消耗名额。endpoint 可变性已消除"换地址烧名额"这一主要
@@ -251,10 +270,11 @@ retired  : 全量扫描零引用后进入；仅保留只读+列举供 gc 清残�
   结构性预防（绑定点合一 + 配置事务前置校验）从构造上消除。
 - **INV-2（可读）**：meta 中存在的 slice，其 id 位声明的桶中必须有**全部
   block**（迁移保留期内的旧副本读取例外，见 INV-6）。
-- **INV-3（注册表身份）**：ref ↔ 逻辑容器绑定不可变；ref 永不复用；同一物理
-  桶严禁多 ref 注册；一切进入注册表的配置（注册/改地址/改凭证）必须通过
-  §3.2 配置事务的前置校验——**错误配置进不了 Format**；下线必须走完整
-  状态机（§3.2），"零引用扫描"单独不构成下线证明。
+- **INV-3（注册表身份）**：ref ↔ 逻辑容器绑定不可变；ref 永不复用；身份的
+  定义与判定 = **注册表 IdentityUUID 与桶内 bucket_id 内容的活体一致**
+  （§3.2 配置事务协议：注册比对 + CAS 提交 + 回读校验；改址比对；跨桶删除
+  决策前双端活体互异校验）；下线必须走完整状态机（§3.2），"零引用扫描"
+  单独不构成下线证明。
 - **INV-4（ID 域）**：rawID < 2^56；bit 59-63 恒 0；持久输入校验失败返回
   显式错误。
 - **INV-5（迁移在途保护——暂存 inode）**：迁移新对象在 swap 提交前必须
@@ -761,6 +781,10 @@ func gc() {
 // 绝不基于负证据（404/超时/限流误判）删除。
 func healMisplaced(x ref, obj) {
     Y := bucketOf(idOf(obj))
+    // 前置（第三轮 S0-1 修订）：物理互异活体校验——经 X 读 bucket_id == UUID_X
+    // 且经 Y 读 == UUID_Y，任一不成立 → 中止 + 告警（同一物理桶无法同时等于
+    // 两个不同 UUID；别名场景下"删冗余"会变成"删本体"，此校验结构性挡住）
+    if !verifyDistinct(x, Y) { report(IDENTITY_MISMATCH); return }
     if obj.Size != expectedSizeFromKey(obj.Key) {
         report(CORRUPT, obj); return          // 尺寸不符的杂散对象：不传播、不删，留人工
     }

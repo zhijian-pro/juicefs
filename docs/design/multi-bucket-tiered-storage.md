@@ -268,7 +268,9 @@ Bucket 注册表项含 IdentityUUID 字段；桶内对象 <name>/bucket_id 的�
 - **INV-1（驻留不变量与删除纪律）**：id 位声明 ref=N 的对象只应存在于桶 N。
   错位对象的处置分三态：**死的**（id 不在 meta）由泄露规则直接删（与桶无关）；
   **活的**走 gc 内置的正证据修复协议（§5.7 `healMisplaced`：copy-verify-delete，
-  删除只发生在正面确认正确桶有完好副本之后）；**尺寸不符/heal 失败**的只报告
+  删除只发生在删除时刻的正证据之后：Y 缺失 → copy+回读验证后删；Y 存在 →
+  **逐字节比较一致**才删（同义反复级安全），不一致报 BAD_REPLICA）；
+  **互异校验不过/比较不一致/heal 失败**的只报告
   留人工。**禁止基于负证据（404/单信号"位≠桶"）的删除**——"错位"信号无法
   区分"多余拷贝"与"bug 写错地方的唯一真身"，而后者经 heal 可完整恢复
   （错位副本对读者本就不可见，heal 同时修复读故障）。错位写入本身由 §4
@@ -797,16 +799,22 @@ func healMisplaced(x ref, obj) {
     // 且经 Y 读 == UUID_Y，任一不成立 → 中止 + 告警（同一物理桶无法同时等于
     // 两个不同 UUID；别名场景下"删冗余"会变成"删本体"，此校验结构性挡住）
     if !verifyDistinct(x, Y) { report(IDENTITY_MISMATCH); return }
-    if obj.Size != expectedSizeFromKey(obj.Key) {
-        report(CORRUPT, obj); return          // 尺寸不符的杂散对象：不传播、不删，留人工
-    }
-    if y, err := Y.Head(obj.Key); err == nil && y.Size == obj.Size {
-        delete(X, obj)                        // 正证据①：Y 已有完好副本 → X 中是冗余，删
+    // 注意：不做"对象 Size vs key 声明长度"比较——key 里是逻辑块长，
+    // 对象是压缩后的物理长，两者不可比（第三轮 S0-2 修正的确定性 bug）
+    if Y.Exists(obj.Key) {
+        // Y 已有副本：不判断"谁好"，直接逐字节比较两份物理副本——
+        // 一致 ⇒ 删其一必然安全（同义反复级正证据，不依赖任何假设）
+        if bytesEqual(X.Get(obj.Key), Y.Get(obj.Key)) {
+            delete(X, obj)
+        } else {
+            report(BAD_REPLICA, obj)          // 不一致 = 自身 data-path bug 的证据，
+        }                                     // 零动作，留人工仲裁
         return
     }
-    copy(X → Y, obj)                          // 先修复：唯一副本搬到正确桶（读故障随之恢复）
-    if verifyReadback(Y, obj) {               // 正证据②：回读确认
-        delete(X, obj)                        // 此刻 Y 必然有 → 删 X，读者全程无感知
+    copy(X → Y, obj)                          // Y 缺失 → 先修复：副本搬到正确桶
+                                              // （读故障随之恢复）
+    if verifyReadback(Y, obj) {               // 回读正证据：内容确认落 Y
+        delete(X, obj)                        // 此刻删 X，读者全程无感知
     }                                         // 任一步失败 → 零动作，幂等，下轮重试
 }
 // 并发迁移把该 id 换掉 → 对象转死 → 下轮泄露规则清理，与 heal 无冲突。

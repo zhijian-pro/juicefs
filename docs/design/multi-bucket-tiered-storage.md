@@ -192,7 +192,9 @@ type Format struct {
 }
 
 type Tier struct {
-    ID        uint8
+    ID        uint8  // 终身不可删除、不复用（glm53 M-R3-5：删除会使存量
+                     // attr.Tier 悬空 → open 永久 EIO 且无自愈路径——
+                     // 与 BucketRef 同级的"只增"纪律）
     Sc        string // storage class：可修改（成本操作，不影响正确性）
     BucketRef uint8  // 指向 Buckets；0 = 默认桶。创建后不可修改（ADR-1.1 半可变）：
                      // 换桶 = 新建 tier + 显式迁移。消除"改指针批量重定向"的
@@ -281,8 +283,10 @@ Bucket 注册表项含 IdentityUUID 字段；桶内对象 <name>/bucket_id 的�
   区分"多余拷贝"与"bug 写错地方的唯一真身"，而后者经 heal 可完整恢复
   （错位副本对读者本就不可见，heal 同时修复读故障）。错位写入本身由 §4
   结构性预防（绑定点合一 + 配置事务前置校验）从构造上消除。
-- **INV-2（可读）**：meta 中存在的 slice，其 id 位声明的桶中必须有**全部
-  block**（迁移保留期内的旧副本读取例外，见 INV-6）。
+- **INV-2（可读，限定用户可见 inode——glm53 M-R3-7）**：**用户可见 inode**
+  的 slice，其 id 位声明的桶中必须有**全部 block**。内部暂存 holder 的条目
+  在拷贝完成前"有条目、无对象"是设计内合法态，**豁免直接写入不变量本身**
+  （避免实现者把豁免范围放错）。
 - **INV-3（注册表身份）**：ref ↔ 逻辑容器绑定不可变；ref 永不复用；身份的
   定义与判定 = **注册表 IdentityUUID 与桶内 bucket_id 内容的活体一致**
   （§3.2 配置事务协议：注册比对 + CAS 提交 + 回读校验；改址比对；跨桶删除
@@ -290,15 +294,26 @@ Bucket 注册表项含 IdentityUUID 字段；桶内对象 <name>/bucket_id 的�
   单独不构成下线证明。
 - **INV-4（ID 域）**：rawID < 2^56；bit 59-63 恒 0；持久输入校验失败返回
   显式错误。
-- **INV-5（迁移在途保护——暂存 holder，第三轮简化版）**：迁移新对象在 swap
-  提交前必须**已被内部暂存 inode 的 slice 条目引用**（detached node）：条目
-  在首个 PUT 之前以**专用 pin 原语**批量写入（无配额/Attr 副作用、不触发
-  自动 compact），新 id 对 `ScanSlices` 可见、ref ≥ 1，gc 的现有 liveness
-  规则天然保护。holder 带**内部角色 flag**，`compactChunk` 唯一入口处豁免
-  （自动触发与 CompactAll 都汇于此；未豁免的后果是条目被合并改写 →
-  迁移白拷重试，属效率问题非丢数据，但必须防活锁）。holder 为**批级短命**
-  （swap 即清，崩溃遗留由现有 detached 清理 24h 兜底 → ref 归零 → 现有
-  延迟删除清孤儿）。swap 事务内 `StagingHolds` 校验（僵尸防护）。
+- **INV-5（迁移在途保护——暂存 holder，第三轮定稿：glm53 S0-R3-1/2 与
+  H-R3-1 修订）**：迁移新对象在 swap 提交前必须**已被暂存 holder 的 slice
+  条目引用**。holder 结构强制为 **detached 目录（Job root）+ 内部 regular
+  file 页**，pin 条目写入页文件——**这是被清理机制的代码事实逼出的唯一解**：
+  `doCleanupDetachedNode` 三引擎均为 emptyDir + 删 inode 记录，对 inode
+  直接承载的 chunk 记录**一行不碰、ref 一个不减**（`cleanupLeakedChunks`
+  兜底同样不减 ref）——直接挂 chunk 的 detached inode 崩溃后是**永久孤儿
+  记录 + 活集合污染**；而 emptyDir → unlink **子文件** → 正常文件数据删除
+  → ref 递减这条链路是**真实存在**的。
+  - **页生命周期**：每批一个页文件（条目数 ≤ 批大小 64，天然有界），
+    pin → swap → 删页，页存活分钟级；**Job root 每批心跳刷新 Added 时间戳**
+    ——多天大迁移不会被 24h detached 清理误收（现状 gc 清理边界硬编码
+    now-24h，cmd/gc.go:153，边界配置化列入实现项）；
+  - pin 走**专用原语**（单事务批量、零配额/Attr 副作用、不触发自动 compact）；
+    holder inode 带**内部角色 flag**，`compactChunk` 唯一入口处豁免；
+  - **swap 事务的冲突键集必须显式包含所读的暂存页 chunk 键**（Redis：WATCH
+    页 chunk 键；SQL：FOR UPDATE 锁页 chunk 行；TKV：页键入 CAS 集）——
+    `StagingHolds` 校验的效力完全取决于此；清理事务与 `RemoveDetached`
+    同理必须把页键纳入各自冲突集。三个事务的读写集逐引擎写入实现规范 +
+    共享测试向量（部分已 swap/未 swap、ref 0/1/1+n 分布）。
 - **INV-6：已取消（第三轮决策）**。原条款为迁移旧对象的独立保留期（退役
   inode）。在**对象存储持久性假设**（§2.2）下其两个职责均不成立：
   ① 恢复源——新副本 swap 前已完整校验，落库后按假设永远完好，无需恢复源；
@@ -332,8 +347,10 @@ type bucketRouter struct {
 **客户端全量预建（用户决策）**：挂载/gateway/SDK **启动时按注册表一次性
 预建全部桶的 storage client**（active/draining/sealed；retired 已证零引用，
 仅 gc/fsck 工具按需构建）——读写路径只做数组取用，**无懒初始化、无锁、
-无首次使用竞态**。预建是纯构造（不含网络 I/O）；某桶运行期不可达只影响
-该桶的文件（故障域隔离，§12.4），不阻塞挂载。Reload 新增桶时同样立即预建。
+无首次使用竞态**。预建构造**不做对象存储 I/O**；但凭证本地化模式下的凭证链
+解析（instance role/IRSA 走 IMDS）**可能是网络调用**（glm53 M-R3-4）——凭证
+解析异步化，未就绪/失败只标记该桶不健康（读它的文件 EIO）、**不阻塞挂载**
+（故障域隔离，§12.4）。Reload 新增桶时同样立即预建。
 
 **Key namespace 路由表**（第二轮评审 S0-4：同一 storage 还承载非 chunk
 对象——`meta/*` 元数据自动备份 vfs/backup.go:134、`testing/*` 连通性测试
@@ -466,7 +483,10 @@ func (s *wSlice) upload(indx) {
 **staging footer schema 迁移**（第二轮评审 H-1）：现状 footer 只有
 `Tier uint8`（disk_cache_file.go），回放时二次解析可变的 Tiers 定义——与
 快照原则冲突。新 schema 为 `{BucketRef uint8, Sc string}`（msgpack 向后
-兼容：读到只含 Tier 字段的旧 footer 时，按启动时 Format 解析一次并告警；
+兼容：读到只含 Tier 字段的旧 footer 时，按启动时 Format 解析一次并告警。
+**写入条件重定义**（glm53 L-R3-2）：现状仅 tierID≠0 才写 footer
+（disk_cache.go:544）——新 schema 改为**恒写**，避免"以为有 footer 实际没有"
+的回放歧义；
 未知 tier → 该 staged 块报错滞留、人工处理，不静默回退）。
 
 **并发分析（writeback）**
@@ -524,8 +544,8 @@ func migrateFile(inode, dstTier) error {
     dst := format.Tiers[dstTier]
     dstStore := router.stores[dst.BucketRef]      // 绑定点合一：目标实例解析一次
     dedup := map[uint64]uint64{}                  // 会话级 oldID→newID 共享去重（§5.5）
-    stagingIno := meta.GetOrCreateDetached(J1)    // 暂存 holder（INV-5：角色 flag，
-                                                  // compactChunk 入口豁免，批级短命）
+    jobRoot := meta.GetOrCreateDetached(J1)       // 暂存 holder = detached 目录（Job root），
+                                                  // 每批心跳刷新 Added（INV-5，防 24h 误收）
 
     for each chunk of inode {
         slices := meta.ReadChunk(inode, chunkIdx)
@@ -541,10 +561,12 @@ func migrateFile(inode, dstTier) error {
                 }
                 rewrites = append(rewrites, {old: s.id, new: newID, entries: entriesOf(s)})
             }
-            // 2. 挂暂存：首个 PUT 之前，用【专用 pin 原语】批量写入暂存 holder
-            //    （单事务多条目、零配额/Attr 副作用、不触发自动 compact——High-2）
+            // 2. 挂暂存：首个 PUT 之前，建【本批页文件】并以专用 pin 原语批量写入
+            //    （每批一页，条目 ≤64 天然有界；单事务、零配额/Attr 副作用、
+            //     不触发自动 compact——High-2/M-R3-3）
             //    ⇒ 新 id 立即 live（ScanSlices 可见，ref≥1），gc 零感知地保护它们
-            meta.PinSlices(stagingIno, plan)
+            page := meta.CreatePinPage(jobRoot, batchSeq)
+            meta.PinSlices(page, plan); meta.TouchDetached(jobRoot) // 心跳
             // 3. 完整 block manifest 复制 + 校验（S0-5）：slice 是多个 block 对象，
             //    全部复制并逐块校验 size 后才有资格进事务——半拷贝+换 ID = 不可读
             for r := range plan {
@@ -560,9 +582,9 @@ func migrateFile(inode, dstTier) error {
                 if tx.GetAttr(inode).Tier != dstTier { // 防乒乓：意图已被并发迁移改写
                     return ErrSuperseded               // 整个迁移终止，让位给新意图
                 }
-                if !tx.StagingHolds(stagingIno, rewrites.new) {
-                    return ErrOrphaned                 // 僵尸防护：暂存条目已被到期清理
-                }                                      // → 本批作废重来（新副本可能已被清）
+                if !tx.StagingHolds(page, rewrites.new) {  // 冲突键：页 chunk 键必须
+                    return ErrOrphaned                     // 显式入 WATCH/行锁/CAS 集
+                }                                          //（S0-R3-2，否则校验在陈旧快照上通过）
                 cur := tx.ReadChunk(inode, chunkIdx)
                 if !matchEntries(cur, rewrites) {      // 逐条目匹配（含同 id 多条目，H-3）
                     return ErrRetry                    // 并发写/compact 动过 → 重读重批
@@ -582,9 +604,12 @@ func migrateFile(inode, dstTier) error {
     }
     // 7. 收敛检查：迁移期间的并发新写（W-2）可能又落了旧桶
     if !converged(inode, dst.BucketRef) { rescan(inode) }
-    meta.RemoveDetached(stagingIno)   // 8. Job 收尾：删暂存 holder（新 id ref 减 1，正常服役）
-    return nil                        //    崩溃遗留 → 现有 CleanupDetachedNodesBefore 到期清理
-}                                     //    → 未 swap 的 ref 归零 → 现有延迟删除清孤儿
+    meta.RemovePinPage(page)          // 每批 swap 后删页：走"unlink 普通文件 → 正常
+                                      // 数据删除 → ref 递减"这条【真实存在】的链路
+    ...
+    meta.RemoveDetached(jobRoot)      // 8. Job 收尾：删空的 root 目录
+    return nil                        //    崩溃遗留 → detached 清理 emptyDir 逐页 unlink
+}                                     //    → ref 递减 → 延迟删除清孤儿（INV-5 页结构的意义）
 ```
 
 > **事务粒度依据（chunk × 批）**：slice 条目在三引擎中都不是独立寻址实体
@@ -787,7 +812,9 @@ chunk 内 `len(compacted) ≥ 2` 才触发（base.go:2865）——顺序写规�
 
 ```go
 func gc() {
-    window := max(configuredWindow, minSafeWindow)   // JFS_GC_SKIPPEDTIME 有强制安全下限
+    window := max(configuredWindow, minSafeWindow)   // 下限为【待实现】的新代码：
+                                                     // 现状该环境变量按秒原样解析、无任何下限
+                                                     //（cmd/gc.go:122-131，glm53 M-R3-1 核实）
     liveIDs := meta.ScanSlices()                     // 打标 id 全集（opaque 透传）
                                                      // 天然包含暂存 holder 的条目（INV-5）
                                                      // ⇒ 迁移在途副本就是普通活对象，
@@ -800,6 +827,9 @@ func gc() {
             switch {
             case bucketRefOf(id) > maxKnownRef:
                 report(UNKNOWN_REF, obj)             // 持有过期 Format 的 gc 保守跳过（G-5）
+                // 注意（glm53 M-R3-8）：bucketRefOf 掩 3 位，未来 ref≥8 的 id 在此
+                // 检查下会模取混叠——G-5 判定必须发生在 validateID（全保留位）之后，
+                // 且 bit 59 拓宽时解码门与 bucketRefBits 原子联动
             case !liveIDs.Contains(id):
                 // S0-6（第三轮）：liveIDs 是扫描起点的快照，存在 TOCTOU——
                 // 删除候选【执行前】逐个点查 meta 复核（sliceRef/holder 引用
@@ -840,7 +870,9 @@ func healMisplaced(x ref, obj) {
         return
     }
     copy(X → Y, obj)                          // Y 缺失 → 先修复：副本搬到正确桶
-                                              // （读故障随之恢复）
+                                              // （读故障随之恢复）。若 X 本身是自身
+                                              // bug 的坏产物，拷贝是【保全现状】而非
+                                              // 引入损坏——不删除即不恶化（H-R3-4 残余）
     if verifyReadback(Y, obj) {               // 回读正证据：内容确认落 Y
         delete(X, obj)                        // 此刻删 X，读者全程无感知
     }                                         // 任一步失败 → 零动作，幂等，下轮重试
@@ -852,7 +884,7 @@ func healMisplaced(x ref, obj) {
 
 | 编号 | 场景 | 行为与结论 |
 |---|---|---|
-| G-1 | gc 与 迁移并发 | 见 M-5：在途副本被暂存 holder 引用 = 普通活对象，gc 零感知；崩溃遗留的暂存 holder 由现有 `CleanupDetachedNodesBefore` 到期清理 → ref 归零 → 现有延迟删除清孤儿。 |
+| G-1 | gc 与 迁移并发 | 见 M-5：在途副本被暂存页引用 = 普通活对象，gc 零感知；崩溃遗留 = detached 清理 emptyDir → 逐页 unlink → ref 递减 → 延迟删除清孤儿（页结构保证走真实存在的清理链路）。 |
 | G-2 | gc 与 写入并发 | 现状既有语义（PUT→meta 提交秒级窗口 << 窗口下限），多桶不改变假设。 |
 | G-3 | 两个 gc 并发 | 删除幂等；逐桶扫描只读。与现状一致。 |
 | G-4 | gc 与 桶 retire | retired 桶仍被扫描清残；**sealed→retired 的推进条件（第三轮 Medium-1，四项缺一不可）**：① 无 target ref 指向该桶；② 该桶内**无未处置的活错位对象**（它可能是别的 ref 的唯一恢复源——"按 ref 零引用"与"桶内无唯一副本"不是同一命题）；③ 最近一次完整 List 成功无缺口；④ 连续 N 轮 gc 零命中。任何 List/Head/凭证错误阻断推进；tombstone 只能是显式的数据损失豁免操作，不是自动降级。 |
@@ -891,7 +923,7 @@ holder 按角色解读：条目缺对象 = 在途（结合 Job 状态报告进�
 
 | 编号 | 中断点 | 落到的状态 | 恢复方式 |
 |---|---|---|---|
-| F-1 | 迁移：PUT 新对象后、swap 提交前崩溃 | 新对象被遗留的暂存 inode 引用（活的，gc 不碰） | 现有 `CleanupDetachedNodesBefore` 到期清理暂存 inode → ref 归零 → 现有延迟删除清孤儿；重跑迁移分配新 id，幂等 |
+| F-1 | 迁移：PUT 新对象后、swap 提交前崩溃 | 新对象被遗留的暂存页引用（活的，gc 不碰） | detached 清理 emptyDir → 逐页 unlink（普通文件删除 → **ref 递减**，此链路真实存在——glm53 S0-R3-1）→ 延迟删除清孤儿；重跑迁移分配新 id，幂等 |
 | F-2 | 迁移：部分批已提交后崩溃 | 文件混桶：已迁 slice 读新桶、未迁读旧桶，**全部可读**（自描述） | 重跑 `tier set`（第 1 步 CAS 对相同目标直接通过），按"位≠目标"续迁；或等 compact 收敛 |
 | F-3 | 迁移：swap 已提交、旧对象延迟删除执行中崩溃 | 旧对象待删（与 compact 同构） | 现状 delslices 机制重启后继续（自路由删除） |
 | F-4 | 写入：PUT 成功、meta Write 未提交崩溃 | 孤儿对象 | 现状语义，gc 清理（窗口保护内不误删） |
@@ -983,7 +1015,7 @@ inode 类型是否受多桶影响，取决于它有没有 slice：
   Format/版本/ID 域；老二进制 load 新 dump 会"先写库、丢 Buckets、最后才
   报版本错"——目标是空库，故后果为可整库清除重试的半成品（非数据损失），
   运维指引：load 失败即清库重跑，勿在残库上二次操作；
-- load 校验（§3.1）：计数器域、BucketRef 存在性；
+- load 校验（§3.1）：计数器域、BucketRef 存在性、**attr.Tier 在目标卷 Tiers 中的存在性**（glm53 M-R3-5：防悬空 tier → 永久 EIO）；
 - `Buckets`/`Tiers` 随 Format 整体 dump；脱敏遵守 §3.2。
 
 ### 7.3 回滚（软单向门）
@@ -1058,7 +1090,7 @@ meta 备份的有效性坍缩到删除延迟（TrashDays）之内**。运维军�
 | # | 条款 | 落点 | 来源 |
 |---|---|---|---|
 | S0-1 | 错位对象删除纪律：INV-7 副本安全不变量为总纲（单副本必在目标端、双副本至少一个在目标端、删除仅随正证据）→ gc 内置 heal 协议（copy-verify-delete，§5.7）；错位写入由**结构性预防**消除（§4 绑定点合一 + §3.2 配置事务前置校验——后者同时是 heal 在别名场景下正确性的前提）；**注册后的桶间手动拷贝列为运维禁令**（用户确认） | §3.2 / §3.4 INV-7 / §4 / §5.7 | 红队发现；探针、INV-7、构造性预防均采纳自决策讨论 |
-| S0-2 | 迁移在途保护 = 暂存 holder（INV-5 第三轮简化版：角色 flag + compactChunk 豁免 + 专用 pin 原语 + 批级短命）+ StagingHolds 僵尸防护 + gc 删除候选执行前点查复核；~~退役 inode~~ 已随 INV-6 取消（对象存储持久性假设）；gc 窗口下限保留护普通写入 | §2.2 / §3.4 / §5.4 / §5.7 | 双方发现；方案经第三轮评审（S0-3/High-1/2/3）修订 |
+| S0-2 | 迁移在途保护 = 暂存 holder（INV-5 第三轮简化版：角色 flag + compactChunk 豁免 + 专用 pin 原语 + 批级短命）+ StagingHolds 僵尸防护 + gc 删除候选执行前点查复核；~~退役 inode~~ 已随 INV-6 取消（对象存储持久性假设）；gc 窗口下限护普通写入（**待实现**：现状 `JFS_GC_SKIPPEDTIME` 无下限，glm53 M-R3-1） | §2.2 / §3.4 / §5.4 / §5.7 | 双方发现；方案经第三轮评审（S0-3/High-1/2/3）修订 |
 | S0-3 | 版本门控两阶段激活（活跃会话版本扫描）；撤回"机制已存在"（`Load(false)` 不复查已证伪） | §7.1 / M-7 | 双方（外部证伪） |
 | S0-4 | key namespace 路由表（`meta/`、`testing/`、`juicefs_uuid` 控制对象恒 ref 0）+ chunk key 解析失败显式报错、绝不回退 ref 0 | §4 | 外部独有 |
 | S0-5 | 迁移单元 = 完整 block manifest：全部 block 复制 + 逐块校验后才允许 CAS 换 ID | §5.4 | 外部独有 |
@@ -1112,6 +1144,27 @@ per-bucket/tier 可观测指标与 `tier status` 收敛度量（§12.4）；rena
 | High-10 | gateway 建 tmp/part 前解析目标父目录 placement 并显式设置 | §5.1 |
 | Medium-1 | sealed→retired 四项 blocker，tombstone 仅显式豁免 | G-4 |
 | Medium-2 | 代码引用带完整包路径 | 全文约定 |
+
+### 第三轮并行评审 glm53 条款与处置
+
+| # | 发现 | 判定与处置 |
+|---|---|---|
+| S0-R3-1 | detached 清理不处理 chunk 记录、不减 ref（已验证）——"现有机制兜底"声明为假 | **成立**：holder 结构强制为 detached 目录+regular file 页，清理走真实存在的"unlink 子文件→ref 递减"链路（INV-5 定稿） |
+| S0-R3-2 | StagingHolds 未指定事务冲突键集，TOCTOU 敞开 | **成立**：swap/清理/RemoveDetached 三事务读写集逐引擎规范化（INV-5） |
+| H-R3-1 | 24h 到期 × 多天 Job 无心跳 → 活锁/重拷 | **成立**：页级生命周期 + Job root 每批心跳；gc 边界配置化入实现项 |
+| H-R3-2 | 只读挂载/no-session SDK 不登记 session | 与 codex S0-5 重复，已处置（§7.1）；其"ListSessions 原语不存在"子句与已验证代码矛盾，**存疑** |
+| H-R3-3 | heal 别名删除需删除时点复核 | 已解决（S0-1 verifyDistinct） |
+| H-R3-4 | Head+Size 假阳性/覆盖传播 | 大部分已解决（S0-2 字节比较）；copy 分支补"保全现状"说明 |
+| M-R3-1 | 窗口下限"已有"与代码相反 | **成立**：措辞改待实现，入 Phase 1 |
+| M-R3-2 | Write 自动 compact 命中 holder | 重复，已解决（pin 原语+flag） |
+| M-R3-3 | holder 大 key/ScanSlices 读放大 | **成立**：页模型条目 ≤64 天然有界 |
+| M-R3-4 | 预建"无网络 I/O"与 IRSA 矛盾 | **成立**：措辞修正+凭证解析异步化（§4） |
+| M-R3-5 | tier 可删性未规定；load 不校验悬空 | **成立**：tier ID 终身不可删；load 校验 attr.Tier 存在性 |
+| M-R3-6 | 退役保留期向上耦合 | 失效（INV-6 已取消） |
+| M-R3-7 | INV-2 与暂存豁免矛盾 | **成立**：INV-2 限定用户可见 inode |
+| M-R3-8 | 3-bit 掩码对 ref≥8 模取盲区 | **成立（前瞻）**：G-5 判定置于 validateID 之后，拓宽原子联动 |
+| L-R3-2 | footer 仅 tierID≠0 才写 | **成立**：新 schema 恒写 |
+| L-R3-1/3 | 引用核查无漂移；INV-7 逐操作扫描无新违规 | 正面确认，无动作 |
 
 ## 10. 分期实施
 
@@ -1199,6 +1252,9 @@ per-bucket/tier 可观测指标与 `tier status` 收敛度量（§12.4）；rena
 
 4. retire 的 N 值、sealed 排空验证手段与 tombstone 清单格式（建议默认：
    N=3 可配 + session 枚举验证 + JSON 残留清单，届时确认）。
+   **补充难点（glm53）**：sealed 排空的 staging 维度涉及各客户端**本地盘上的
+   staged 块**——meta 侧不可观测，需客户端上报（session 心跳携带 staging
+   存量）或保守等待窗口，Phase 2 细化时一并定。
 
 ## 12. 成本模型与故障域（第二轮评审新增）
 

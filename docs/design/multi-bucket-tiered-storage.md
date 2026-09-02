@@ -213,7 +213,10 @@ sealed   : 禁止任何新 PUT 与新元数据引用；等待旧句柄 / staging
            暂存条目全部排空（按 session 枚举验证）；存量数据仍可读
 retired  : 全量扫描零引用后进入；仅保留只读+列举供 gc 清残；凭证永久失效时
            转 tombstone（放弃列举，残留对象按最后一次清单人工处理，
-           gc/fsck 跳过并告警而非挂死）
+           gc/fsck 跳过并告警而非挂死）。tombstone 前置条件（fable5 M-D）：
+           必须完成一次全量 heal 收敛验证——该桶内无"活的错位唯一副本"
+           残留，否则 INV-7 D2 的收敛义务在不可读桶上永久无法履行；
+           tombstone 是显式的数据损失豁免操作，不是自动降级
 ```
 
 - **ref 0 的唯一权威来源**：ref 0 永远由现有 `Storage/Bucket/AccessKey/
@@ -307,8 +310,14 @@ Bucket 注册表项含 IdentityUUID 字段；桶内对象 <name>/bucket_id 的�
     pin → swap → 删页，页存活分钟级；**Job root 每批心跳刷新 Added 时间戳**
     ——多天大迁移不会被 24h detached 清理误收（现状 gc 清理边界硬编码
     now-24h，cmd/gc.go:153，边界配置化列入实现项）；
-  - pin 走**专用原语**（单事务批量、零配额/Attr 副作用、不触发自动 compact）；
-    holder inode 带**内部角色 flag**，`compactChunk` 唯一入口处豁免；
+  - pin 走**专用原语**（单事务批量、零配额/Attr/dirStat 副作用、不触发自动
+    compact；页文件 **Parent = 专用保留 inode**，统计更新短路——fable5 H-G）；
+    holder inode 带**内部角色 flag**，`compactChunk` 唯一入口处豁免——
+    该入口同时汇集**写触发**（base.go:2196）与**读触发**（base.go:2140），
+    且 compact 执行者是任意注册 OnMsg 的客户端（与迁移工具进程无关），
+    豁免必须在共享路径而非工具自律（fable5 S0-A 佐证）；
+  - detached 清理需**后台周期任务**（现状仅 `gc --delete` 一个触发点——
+    不跑 gc 的部署崩溃遗留永不回收，fable5 H-B/M-G）；
   - **swap 事务的冲突键集必须显式包含所读的暂存页 chunk 键**（Redis：WATCH
     页 chunk 键；SQL：FOR UPDATE 锁页 chunk 行；TKV：页键入 CAS 集）——
     `StagingHolds` 校验的效力完全取决于此；清理事务与 `RemoveDetached`
@@ -452,7 +461,7 @@ placement 一律显式报错，不回退默认值。
 
 | 编号 | 场景 | 行为与结论 |
 |---|---|---|
-| W-1 | C1、C2 并发写同一文件（各自 open 快照的 tier 不同，例如中间隔了 tier set） | 各自的 slice 打各自的桶位，**都自描述、都可读**。文件暂时混桶，由迁移/compact 收敛。POSIX 对并发写本就不保证内容顺序，此处不引入新语义。 |
+| W-1 | C1、C2 并发写同一文件（各自 open 快照的 tier 不同，例如中间隔了 tier set） | **精确语义（fable5 M-A 修正）**：fileWriter 按 inode 复用（writer.go:515），同一 inode 的并发写 placement 以**最新 open 为准**（last-open-wins，High-5 修正后的行为）——不是"各写各桶"而是"共享 writer、新 slice 取当前 placement"。任一时刻写出的 slice 都自描述、可读；文件暂时混桶由迁移/compact 收敛。 |
 | W-2 | 写入 与 `tier set`（SetAttr 翻转）并发 | 已 open 句柄继续写旧桶（快照），落下的是"旧位但正确"的数据；迁移工具重扫收敛（见 5.4）。**不存在错位数据**（对比文件级方案：attr 已新、数据在旧桶且无从判定）。 |
 | W-3 | 写入 与 tier 定义变更并发 | ADR-1.1 后 tier 的 BucketRef **不可改**，此场景只剩改 Sc：句柄用 open 快照的 sc，新 open 用新值——sc 漂移无害（不影响可读性），fsck 对账。原"改 BucketRef 并发"场景已被半可变决策**结构性消除**。 |
 | W-4 | C1 刚 `config` 加桶并设 tier，C2 的 Format 缓存尚未刷新（OnReload 周期），C2 打开 attr.Tier=新 tier 的文件 | C2 解析失败 → 强制 reload Format 重试 → 仍失败则 **EIO**（此时只剩真配置错误或 meta 不可达）。规则：宁可失败，绝不静默落错桶——与现状 `getRuntimeTier` 静默回退 tiers[0] 的行为相反，属有意变更。运维消窗口：先定义 tier、过一个心跳周期再让 attr 引用；`tier set` 内置提示。 |
@@ -463,8 +472,13 @@ Put/Copy/MPU 都先在 `.sys` 隐藏目录下建临时文件再 Rename 到目标
 （gateway.go:55,806-867）——而 rename 不重继承 Tier（决策 #7）⇒ 所有
 gateway 写入将恒定继承 `.sys` 的 tier（默认 ref0），**目录继承的放置意图
 被整体绕过**。修复约定：gateway 创建 tmp / MPU part 前**解析最终目标路径
-的父目录 placement**，显式设置到 tmp inode（内部 SetAttr）；Put/Copy/MPU/
-Abort/重试全路径 e2e 测试为 Phase 1 gateway 里程碑的验收项。
+的父目录 placement**，显式设置到 tmp inode（内部 SetAttr）——MPU 的 part
+文件同理（part 创建时最终目标 key 已知）。**Complete 语义要点**（fable5
+H-D）：CompleteMultipartUpload 走 CopyFileRange **纯元数据拼接**、不产生
+数据 PUT——若 part 落错桶，拼接产物永久 unconverged（顺序写单 slice chunk
+连 compact 都救不了），part 时机就位是唯一正解；Complete 检测到 part 位≠
+目标的兜底 = 排入一次 op-A（成本可见）。Put/Copy/MPU/Abort/重试全路径
+e2e 测试为 Phase 1 gateway 里程碑的验收项。
 
 ### 5.2 writeback / staging
 
@@ -486,7 +500,12 @@ func (s *wSlice) upload(indx) {
 兼容：读到只含 Tier 字段的旧 footer 时，按启动时 Format 解析一次并告警。
 **写入条件重定义**（glm53 L-R3-2）：现状仅 tierID≠0 才写 footer
 （disk_cache.go:544）——新 schema 改为**恒写**，避免"以为有 footer 实际没有"
-的回放歧义；
+的回放歧义。
+**回放的归类澄清**（fable5 H-A）：staging 回放属于**写路径**，但不违反
+"绑定点合一"——其 placement 取自落盘时刻持久化的 key 位与 footer 快照，
+**不做运行时策略解析**（不查 Tiers）。§4 "写不查表"的准确含义 = "写不做
+运行时策略解析"，回放是该原则的持久化形态而非例外；footer 解析失败一律
+显式滞留报错（现状静默回退 tier 0 的行为废除，cached_store.go:1049）；
 未知 tier → 该 staged 块报错滞留、人工处理，不静默回退）。
 
 **并发分析（writeback）**
@@ -644,6 +663,17 @@ func migrateFile(inode, dstTier) error {
 > 替换而 ref 只 ±1，会过量递减、**提前删除仍被 clone 引用的对象**。三引擎共享
 > 测试必须包含"同 id 多条目 + clone 引用"向量。
 
+> **暂存+真实引用叠加的三引擎期望值表（fable5 H-F，实现规范）**：三引擎 ref
+> 存储约定不同——Redis/TKV"无记录=1 引用、存储值=refs−1、递减后 <0 才物理
+> 删除"；SQL"显式行、真实 refs、≤0 删除"。swap 后 newID 期望 = 暂存 1 +
+> 真实 entries：Redis/TKV 存储值必须为 `entries`（0→+entries），SQL 行必须
+> 为 `1+entries`。**漏算暂存那一份**（写成 entries−1）会在 Job 收尾删页时把
+> 刚迁移完成的唯一副本物理删除。**SQL 前置修复**：现状 clone/copy_file_range
+> 的引用增加是 UPDATE 而非 UPSERT（sql.go:3488/5482，已验证）——目标行不存在
+> 时静默不生效；pin 原语绕开 doWrite 后 SQL 侧将缺行、`+entries` 静默丢失 →
+> 引用永久少算 → 提前删除。所有引用增加改 UPSERT。共享测试向量：
+> "暂存 + N 条目真实 + clone 引用"全排列下的对象存活性断言。
+
 **无锁对象层的删除安全原则**：对象存储没有锁与事务，因此本设计规定**对象层
 永远不承载决策**——迁移工具没有"删除"步骤，删除只能是 meta 事务内 ref 归零
 的延迟副作用。由此，"刚写入的对象被并发迁移删除"需要同时突破三道防线：
@@ -786,6 +816,9 @@ clone 完成即"未收敛"，违背零拷贝初衷。**决策：维持继承源*
 // meta 原样提交同一 id——多桶下【打标必须发生在 meta 侧】（meta 持有 Format，
 // 解析 tier→ref 后下发已打标的 id），回调按 id 位自路由写入；不允许
 // "回调写 stamped key、meta 提交 raw id"的分叉。
+// 协议变更（fable5 H-A）：CompactChunk 消息从 uint8 tierID 升级为
+// {stampedID, BucketRef, Sc}——执行者（任意客户端）据此构造 PlacementKey，
+// 不做本地 Tiers 解析（避免跨进程 Format 偏斜的 W-4 同类窗口）。
 func compactChunk(inode, chunkIdx, tierID) {
     slices := readChunk(inode, chunkIdx)          // 可能混桶（迁移半途/历史写入）
     newRaw := meta.NewSlice()
@@ -824,6 +857,10 @@ func gc() {
             if obj.Mtime > now-window { skip }       // 普通写入既有的缓冲（PUT→提交秒级窗口）
             id, err := parseSliceID(obj.Key)
             if err != nil { report(UNPARSEABLE, obj); continue } // 不删
+            // fable5 M-C（已验证）：现状两种 gc 模式行为不一致——in-memory 的
+            // strconv.Atoi 忽略解析错误（cid=0 → 判 leaked → --delete 误删），
+            // external-sort 解析失败跳过。实现必须统一为本伪代码语义：
+            // 解析失败 = 报告、绝不删除；两模式一致性列入 S0-4 验收项
             switch {
             case bucketRefOf(id) > maxKnownRef:
                 report(UNKNOWN_REF, obj)             // 持有过期 Format 的 gc 保守跳过（G-5）
@@ -917,6 +954,9 @@ func fsck(inode) {
 **内部 inode 特判（INV-2 豁免）**：迁移的暂存 inode 在拷贝完成前处于"有条目、
 无对象"状态——这是设计内的合法态（同 writeback F-5 先例），fsck 对暂存
 holder 按角色解读：条目缺对象 = 在途（结合 Job 状态报告进度），不计入 BROKEN。
+**接口支撑**（fable5 M-H）：ScanSlices 回调仅有 (ino, slice)、无类别信息——
+特判需要新增 `ListDetachedNodes()`（全量列举；现状仅有按时间过滤的
+doFindDetachedNodes）或让回调携带 inode 类别标志，列入 Phase 1 接口清单。
 与在跑的迁移互斥。
 
 ### 5.9 异常中断与崩溃恢复
@@ -932,6 +972,7 @@ holder 按角色解读：条目缺对象 = 在途（结合 Job 状态报告进�
 | F-7 | SetAttr 已翻、迁移完全没跑 | 纯"意图未收敛" | `tier status` 可见；新写已走新桶；重跑或等重扫（compact 只对碎片化 chunk 兜底，见 §5.6） |
 | F-8 | 新对象缺失且事务已提交（需我们自身双重 bug：暂存引用+点查复核同时失效） | chunk 指向缺失对象 | Head 抽验/fsck 检出 → **如实报 BROKEN**（对象存储持久性假设下不设恢复源，见 §2.2 全局假设） |
 | F-9 | 桶 draining/sealed 阶段崩溃 | 状态机持久于 Format，无中间态 | 重启后按状态继续排空；sealed 拒新写由全部客户端依据 Format 共同强制 |
+| F-10 | graceful restart（fable5 H-E） | 句柄序列化持久化 {BucketRef, Sc}（实例引用不跨进程） | 重启后按 BucketRef 直接取实例重建 binding；BucketRef 恒定（ADR-1.1）+ tier 终身不可删（M-R3-5）联合保证重建必然成功，无 EIO 回归 |
 
 **恢复设计的总原则**：所有中断态都落在"自描述、可读、可幂等重跑"的安全域内；
 唯一需要主动补救的只有孤儿对象（gc 兜底）。不存在需要人工判断"数据到底在哪"
@@ -990,8 +1031,13 @@ inode 类型是否受多桶影响，取决于它有没有 slice：
 - **两阶段激活协议（软门，强制）**：
   1. Phase A：`config` 抬升 `MinClientVersion` → 新挂载被拒；等待 ≥ 一个
      完整 heartbeat + session 过期周期；扫描活跃会话版本清单，存在低版本
-     会话 → 拒绝进入 Phase B 并列出；runbook 显式点名清单的不可见项
-     （NoSession SDK / ReadOnly / 暂停中的进程）；
+     会话 → 拒绝进入 Phase B 并列出；runbook 显式点名**完整不可见清单**
+     （fable5 S0-C 已验证）：只读挂载（NewSession 提前 return）、
+     `sync jfs://` 目标端、`gc --delete`、`restore`、SDK noSession——
+     以上均**可写或可删**；以及 fsck/dump/config/tier/destroy 等命令行
+     工具（destroy 现状已在用这个残缺清单做"无活跃客户端"判断）、
+     暂停中的进程。可选增强（Phase 2+）：可写入口在 NewSlice/doWrite
+     路径登记 `minSeenClientVersion` 水位作为 Phase B 补充证据；
   2. Phase B：软门全绿后允许创建 Buckets 实体项与非 0 BucketRef 的 Tier。
 - **硬围栏（推荐项，用户决策）**：凭证轮换——凭证本地化模式（决策 #6）下，
   新凭证只分发给已升级客户端，轮换默认桶凭证 ⇒ 未升级二进制立即失去对象
@@ -1008,14 +1054,23 @@ inode 类型是否受多桶影响，取决于它有没有 slice：
   引用的对象**。修复：load 完成对外可用前，遍历全部 slice 承载段（FSTree/
   Trash/暂存 holder）求 maxRawID，`nextChunk = max(dumped, maxRawID+1)`。
   **该缺陷上游单桶同样存在，修复值得独立反哺上游**；
-- **JSON 计数器重建用 rawIDOf（High-6）**：现状 loader 以完整 s.Id 重建
-  高水位（dump.go:445-459），任何 ref>0 的 dump 会把 nextChunk 推到 ≥2^56
-  ——恢复出不可写卷。decode 时先 validateID、以 `rawIDOf(s.Id)` 参与求值；
+- **JSON 计数器重建用 rawIDOf（High-6 / fable5 S0-B 精确定位 dump.go:569-571）**：
+  现状 loader 以完整 s.Id 重建高水位，任何 ref>0 的 dump 会把 nextChunk 推到
+  ≥2^56——恢复出不可写卷，且 §3.1 守恒校验会在 load 阶段拒绝完全合法的备份。
+  decode 时先 validateID、以 `rawIDOf(s.Id)` 参与求值。**JSON 正是 `juicefs
+  dump` 默认格式与自动元数据备份（pkg/vfs/backup.go）所用格式——此修复是
+  多桶卷备份可恢复性的必要前提**；
 - **load 前置预检（原 High-7，降 Medium）**：写入目标库前先校验 dump 的
   Format/版本/ID 域；老二进制 load 新 dump 会"先写库、丢 Buckets、最后才
   报版本错"——目标是空库，故后果为可整库清除重试的半成品（非数据损失），
   运维指引：load 失败即清库重跑，勿在残库上二次操作；
 - load 校验（§3.1）：计数器域、BucketRef 存在性、**attr.Tier 在目标卷 Tiers 中的存在性**（glm53 M-R3-5：防悬空 tier → 永久 EIO）；
+- **跨卷 ref 语义校验（fable5 H-C）**：ref 是 per-volume 语义——卷 A 的 ref=3
+  与卷 B 的 ref=3 可指向完全不同的物理桶，"存在性校验"对此是假阴性（load
+  通过但全量 404）。修复：dump 的 Format 段携带每 ref 的 **IdentityUUID**
+  （§3.2 现成材料），load 时逐 ref 与目标卷注册表比对，不一致显式拒绝；
+  提供 `--remap-bucket-ref src=dst`（需全量重写 slice id 高位，成本明示）；
+  同卷恢复（volumeUUID 一致）走快路径免比对；
 - `Buckets`/`Tiers` 随 Format 整体 dump；脱敏遵守 §3.2。
 
 ### 7.3 回滚（软单向门）
@@ -1078,7 +1133,10 @@ meta 备份的有效性坍缩到删除延迟（TrashDays）之内**。运维军�
   脱敏（§3.2）；
 - 凭证轮换：本地化模式 = 客户端本地操作 + 进程内 reload；信封模式 = 注册表
   可变域操作，reload 原子交换实例（§4）；
-- 跨账号最小权限：每桶凭证只授予该桶读写删；gc/fsck 需列举权限，文档注明。
+- 跨账号最小权限：每桶凭证只授予该桶读写删。**显式声明（fable5 M-D）**：
+  gc/heal/迁移 worker 是**全桶特权身份**（heal 需任意 (X,Y) 组合的 X 读删 +
+  Y 写）——与普通客户端的最小权限模型分开描述、分开发放；"只碰热数据的
+  客户端可不配冷桶凭证"的裁剪仅适用于普通客户端。
 
 ## 9. 评审必须项（两轮合并，Must-fix）
 
@@ -1165,6 +1223,29 @@ per-bucket/tier 可观测指标与 `tier status` 收敛度量（§12.4）；rena
 | M-R3-8 | 3-bit 掩码对 ref≥8 模取盲区 | **成立（前瞻）**：G-5 判定置于 validateID 之后，拓宽原子联动 |
 | L-R3-2 | footer 仅 tierID≠0 才写 | **成立**：新 schema 恒写 |
 | L-R3-1/3 | 引用核查无漂移；INV-7 逐操作扫描无新违规 | 正面确认，无动作 |
+
+### 第三轮并行评审 fable5 条款与处置
+
+| # | 发现 | 判定与处置 |
+|---|---|---|
+| S0-A | holder 触发自动 compact（读+写双触发；执行者为任意客户端；产物落 tier0） | 主体已解决（flag+单点豁免+pin）；增量：双触发汇于 compactChunk、豁免必须在共享路径（INV-5） |
+| S0-B | JSON load 重算 NextChunk 用完整 id（dump.go:569-571） | 与 codex High-6 重复；增量：JSON 为默认/自动备份格式的优先级注记（§7.2） |
+| S0-C | session 盲区完整版图（sync/gc/restore/tier 等可写工具全不可见） | 决策已定；完整清单入 §7.1 + minSeenClientVersion 可选增强 |
+| H-A | 三条无句柄写路径的 placement 分叉 | 主体已解决；增量：CompactChunk 消息协议（§5.6）、回放归类澄清（§5.2）、op-B 实例取用（§4） |
+| H-B | 清理仅 gc --delete 触发 + 顺序问题 | glm53 已解决心跳/配置化；增量：后台周期清理（INV-5） |
+| H-C | **跨卷 load ref 语义不对齐（假阴性 → 全量 404）** | **成立（新）**：dump 携带每 ref IdentityUUID 逐项比对 + --remap-bucket-ref + 同卷快路径（§7.2） |
+| H-D | MPU part 继承 uploads tier；Complete 纯元数据拼接 | High-10 已解决主体；增量：Complete 语义与 op-A 兜底（§5.1） |
+| H-E | graceful restart 只序列化 TierID | 已被 {ref,Sc} 序列化 + tier 不可删联合闭环；增量：F-10（§5.9） |
+| H-F | **暂存+真实引用叠加语义未定义；SQL UPDATE 非 UPSERT 静默丢引用** | **成立（新）**：三引擎期望值表 + SQL UPSERT 前置修复 + 全排列存活测试（§5.4） |
+| H-G | Write 污染 Length/dirStat/配额；Parent 未定义 | pin 已解决；增量：Parent=专用保留 inode（INV-5） |
+| M-A | fileWriter per-inode 复用 | High-5 已解决；增量：W-1 措辞精确化 |
+| M-B | 窗口下限不存在 | glm53 M-R3-1 重复 |
+| M-C | **gc 两模式解析失败行为不一致（in-memory 误删）** | **成立（新）**：统一为报告不删，入 S0-4 验收（§5.7） |
+| M-D | **heal 需全桶特权；tombstone 下 INV-7 无法收敛** | **成立（新）**：特权身份声明（§8）+ tombstone 前置收敛验证（§3.2） |
+| M-E | Write 单 slice 接口，成本低估 65 倍 | pin 批量原语已解决；增量：§12.1 修正 |
+| M-F | tier set 第二写通道 | 并入 H-A（§4） |
+| M-G | 不跑 gc --delete 永不回收 | 并入 H-B |
+| M-H | **fsck 无法判定 detached（ScanSlices 无类别）** | **成立（新）**：ListDetachedNodes()/回调类别标志（§5.8） |
 
 ## 10. 分期实施
 
@@ -1261,7 +1342,9 @@ per-bucket/tier 可观测指标与 `tier status` 收敛度量（§12.4）；rena
 ### 12.1 op-A 成本量化
 
 10TB 文件 = 2.6M 个 4MB block 对象。跨云迁移一次性成本：egress ≈ **$900+**
-（按 $0.09/GB）+ 2.6M GET + 2.6M PUT 请求费 + meta 数万批事务；源为归档层
+（按 $0.09/GB）+ 2.6M GET + 2.6M PUT 请求费 + meta 事务约 2×批数（每批一次
+pin 页写入 + 一次 swap——前提是 pin 为批量原语；退化为逐条 Write 则事务量
+×65 不可接受，fable5 M-E）；源为归档层
 另加解冻费与小时级等待。**同云同账号必须走 server-side copy 快路径**：对象层
 新增可选 `CopyFrom(srcRef, key)` 接口（S3 CopyObject 类语义），免 egress、
 免数据过客户端——这是 op-A 在同云场景从"贵"降到"请求费"的关键优化（H-8）。

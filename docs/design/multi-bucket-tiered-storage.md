@@ -152,6 +152,12 @@ func validateID(id uint64) error {
 > （dump/load、对象 key 解析、计数器）校验失败返回显式错误，panic 仅允许用于
 > 进程内已验证的不变量。
 
+**唯一解码门（第三轮 High-8）**：三引擎 chunk 解码（`slice.read`）直接读
+uint64 无校验路径，逐个改造几十个调用点不现实。约定：**统一 key 派生函数
+是数据面唯一的、不可绕过的门**——一切读/写/删/扫描/修复产生对象 key 都必经
+它，`validateID`（保留位/位域）内置其中，违规显式报错；辅以 ref=8（bit 59
+置位）负向测试矩阵覆盖 read/Remove/compact/GC/dump/load/gateway/SDK 全入口。
+
 守恒校验（三处）：
 
 1. `NewSlice`：分配出的 rawID 越界 → 拒绝并报警（理论不可达）；
@@ -351,14 +357,19 @@ key 路由到单桶；`Limits` 取各桶交集；`Shutdown` 广播；任何方�
 
 **错位写入的结构性预防（by construction，取代运行时防线——用户决策）**：
 
-1. **绑定点合一**：写路径不做第二次路由判断。open 时快照的是**桶实例引用
-   本身**（而非 ref 数字），打标由该实例执行（`h.store.StampID(rawID)`）——
-   **key 位与字节去向由同一个对象产生，结构上不存在分叉的代码路径**，
-   PUT 断言成为同义反复、无需存在。路由表过期/reload 竞态对写路径失效
-   （句柄持实例指针，不查表）。读/删仍按 key 解析路由，但方向无害：
-   读错桶 = 404（fail-safe），删错桶 = 删不存在的 key（no-op）——危险方向
-   只有写，而写已被构造封死。可信基座收敛为单一 key 解析函数，由 §3.1
-   位域测试向量表穷举覆盖；
+1. **绑定点合一（第三轮 High-5 精化：binding capability）**：写路径不做
+   第二次路由判断。open 快照的是 **binding = {ref, atomic backend}**——
+   ref 恒定（打标与 key 位的来源），backend 为原子指针（凭证/地址 reload
+   时换内部 backend，binding 身份不变）。打标由 binding 执行
+   （`h.binding.StampID(rawID)`），PUT 走同一 binding——**key 位与字节去向
+   由同一个对象产生，结构上不存在分叉**；同时消解"§3.2 说地址变更对新旧
+   句柄同时生效"与"句柄持具体实例"的表述矛盾。
+   两个连带修正：① **fileWriter 按 inode 复用的缓存**（writer.go:515，
+   已验证）必须让 placement 随最新 open 刷新——新 slice 取当前 binding+sc
+   （否则 W-2"新 open 走新桶"落空）；② graceful-restart 序列化与 staging
+   footer 持久化 {ref, sc}（不是 tierID）。
+   读/删仍按 key 解析路由，方向无害：读错桶 = 404（fail-safe），删错桶 =
+   no-op——危险方向只有写，而写已被构造封死；
 2. **配置事务前置校验**：注册新桶（三层探测，§3.2）与**变更 endpoint**
    都是 config 事务，前置条件 = 经新地址读到匹配的 `bucket_id` 标记
    （卷 UUID + ref 一致），不匹配拒绝写入 Format——**错误地址根本进不了
@@ -429,6 +440,14 @@ placement 一律显式报错，不回退默认值。
 | W-3 | 写入 与 tier 定义变更并发 | ADR-1.1 后 tier 的 BucketRef **不可改**，此场景只剩改 Sc：句柄用 open 快照的 sc，新 open 用新值——sc 漂移无害（不影响可读性），fsck 对账。原"改 BucketRef 并发"场景已被半可变决策**结构性消除**。 |
 | W-4 | C1 刚 `config` 加桶并设 tier，C2 的 Format 缓存尚未刷新（OnReload 周期），C2 打开 attr.Tier=新 tier 的文件 | C2 解析失败 → 强制 reload Format 重试 → 仍失败则 **EIO**（此时只剩真配置错误或 meta 不可达）。规则：宁可失败，绝不静默落错桶——与现状 `getRuntimeTier` 静默回退 tiers[0] 的行为相反，属有意变更。运维消窗口：先定义 tier、过一个心跳周期再让 attr 引用；`tier set` 内置提示。 |
 | W-5 | ID 批分配竞争 | 各客户端独立获取 4096 大小的 rawID 批（现状 `incrCounter("nextChunk")`），打标是本地位或，无新增竞争点。 |
+
+**gateway 临时命名空间的 placement（第三轮 High-10，已验证）**：gateway 的
+Put/Copy/MPU 都先在 `.sys` 隐藏目录下建临时文件再 Rename 到目标路径
+（gateway.go:55,806-867）——而 rename 不重继承 Tier（决策 #7）⇒ 所有
+gateway 写入将恒定继承 `.sys` 的 tier（默认 ref0），**目录继承的放置意图
+被整体绕过**。修复约定：gateway 创建 tmp / MPU part 前**解析最终目标路径
+的父目录 placement**，显式设置到 tmp inode（内部 SetAttr）；Put/Copy/MPU/
+Abort/重试全路径 e2e 测试为 Phase 1 gateway 里程碑的验收项。
 
 ### 5.2 writeback / staging
 
@@ -575,6 +594,12 @@ func migrateFile(inode, dstTier) error {
 > 态复杂化，零收益）；文件级则超出引擎单事务能力且重试代价爆炸。批上限
 > （≈64 条目）压单次事务时长与重做成本。与现状 compact 事务形态同构。
 
+> **热 chunk 重试预算（第三轮 High-9）**：乐观冲突只保证无死锁，不保证进展。
+> 约定：每 chunk 冲突预算 5 轮 + 指数退避；超限转 **defer 终态**（记入 Job
+> 失败清单，本轮跳过，下次 cron 再试），不无限续跑；重试时做 **plan 复用**
+> ——只重拷条目发生变化的 slice，已拷对象凭暂存 holder 引用仍活着，直接
+> 复用（避免重复跨桶传输与计费）。
+
 **迁移的五层粒度**（各维度取现有机制的自然单位）：
 
 | 层 | 粒度 | 说明 |
@@ -644,7 +669,7 @@ A:     后续批次事务校验：chunk 已不含 A 要替换的 id → 失败
 | M-3 | 迁移 与 compact 同 chunk | 两者都在事务内做 chunk 原位替换 → 乐观冲突，一方 `ErrRetry`。compact 产物已带新桶位（attr 已翻转）→ 迁移重读后发现位正确，跳过。无死锁、无丢失。 |
 | M-4 | 迁移 与 clone | clone 在事务内复制 slice 引用并 ref+1。若 clone 先行：迁移 ref-1 后旧 id ref 仍 >0 → **不删旧对象**，clone 文件继续可读（代价：两桶各一份，与原设计文档"clone 变两份数据，可接受"结论一致）。若迁移先行：clone 拿到的已是新 id。引擎事务保证两者串行化。 |
 | M-5 | 迁移 与 GC | **在途副本被暂存 holder 引用（INV-5）——对 gc 是普通活对象，gc 对迁移零感知、零特判**。保护基于引用而非时间：工具挂起再久也不失保护；暂存到期清理后僵尸提交被 swap 事务的 StagingHolds 校验拦下。gc 删除候选执行前逐个点查 meta 复核（S0-6 修复）。旧对象删除与 compact 同构（TrashDays 语义）。 |
-| M-6 | 迁移工具自身多实例（如两台机器跑 `tier apply`） | 同 M-1，Attr CAS 天然互斥到文件粒度；目录级任务用分片（按 inode 取模）避免无谓冲突。**持久 Job 控制面（job id/lease/checkpoint/限速/进度）为 Phase 2 必需**（第二轮评审 H-6），进程内重扫不足以支撑 TB 级跨云迁移的断点与多实例协作。 |
+| M-6 | 迁移工具自身多实例（如两台机器跑 `tier apply`） | 同 M-1，Attr CAS 天然互斥到文件粒度；目录级任务按 inode 取模分片。**持久 Job 控制面为 Phase 2 必需**（H-6）。**第三轮 High-4 修正**：lease 必须带**单调 epoch**——数据面的僵尸提交由 chunk 事务校验兜住，但**控制面**（RemoveDetached 清 holder、checkpoint/status 写回）不受其保护：旧 worker 恢复后可能删掉新 worker 的暂存引用、回退 checkpoint。故 AcquireLease 返回 epoch，控制面每次 mutation 在事务内比对 epoch，暂存 holder 按 {jobID, epoch} 隔离，禁止 job 级盲删。 |
 | M-7 | 迁移 与 老客户端 | **第三轮再修正**：session 扫描存在三个盲区（Load→NewSession 窗口、NoSession/ReadOnly 不登记、过期 session 复活），meta 侧无法保证挡住已运行的老二进制。但残留老客户端**无数据损坏路径**（写落默认桶自洽、读 404 自身 EIO、删除 no-op）——危害 = 放置漂移。软门（版本+等待周期+session 扫描）强制，凭证轮换硬围栏为推荐项（§7.1）。 |
 
 **硬链接的迁移语义**：迁移的操作对象是 inode 而非路径，故 N 个链接**同时生效、
@@ -732,7 +757,10 @@ clone 完成即"未收敛"，违背零拷贝初衷。**决策：维持继承源*
 ### 5.6 Compact
 
 ```go
-// 现状代码几乎不变，仅新 id 打标
+// 第三轮 High-5 修正：现状协议是 meta 先分配 raw id → 回调 VFS 写对象 →
+// meta 原样提交同一 id——多桶下【打标必须发生在 meta 侧】（meta 持有 Format，
+// 解析 tier→ref 后下发已打标的 id），回调按 id 位自路由写入；不允许
+// "回调写 stamped key、meta 提交 raw id"的分叉。
 func compactChunk(inode, chunkIdx, tierID) {
     slices := readChunk(inode, chunkIdx)          // 可能混桶（迁移半途/历史写入）
     newRaw := meta.NewSlice()
@@ -827,7 +855,7 @@ func healMisplaced(x ref, obj) {
 | G-1 | gc 与 迁移并发 | 见 M-5：在途副本被暂存 holder 引用 = 普通活对象，gc 零感知；崩溃遗留的暂存 holder 由现有 `CleanupDetachedNodesBefore` 到期清理 → ref 归零 → 现有延迟删除清孤儿。 |
 | G-2 | gc 与 写入并发 | 现状既有语义（PUT→meta 提交秒级窗口 << 窗口下限），多桶不改变假设。 |
 | G-3 | 两个 gc 并发 | 删除幂等；逐桶扫描只读。与现状一致。 |
-| G-4 | gc 与 桶 retire | retired 桶仍被扫描清残；零引用证明 = 状态机 sealed 排空 + 连续 N 轮 gc 零命中（缺一不可，见 §3.2）；凭证永久失效 → tombstone，gc 跳过并告警而非无限重试挂死。 |
+| G-4 | gc 与 桶 retire | retired 桶仍被扫描清残；**sealed→retired 的推进条件（第三轮 Medium-1，四项缺一不可）**：① 无 target ref 指向该桶；② 该桶内**无未处置的活错位对象**（它可能是别的 ref 的唯一恢复源——"按 ref 零引用"与"桶内无唯一副本"不是同一命题）；③ 最近一次完整 List 成功无缺口；④ 连续 N 轮 gc 零命中。任何 List/Head/凭证错误阻断推进；tombstone 只能是显式的数据损失豁免操作，不是自动降级。 |
 | G-5 | gc 持有过期 Format（不认识新 ref） | id 高位 > 已知最大 ref → 保守跳过并报告，绝不按"错桶/孤儿"删除；处理前先强制 reload Format。 |
 
 ### 5.8 Fsck
@@ -938,11 +966,24 @@ inode 类型是否受多桶影响，取决于它有没有 slice：
   存储访问，覆盖全部三个盲区（包括不碰 meta 的进程）。部署方按合规要求
   选择是否执行；执行后残留客户端清零。
 
-### 7.2 dump/load
+### 7.2 dump/load（含第三轮 S0-4 / High-6 / 前置预检修订）
 
 - 打标 id 以 opaque uint64 透传二进制 dump（chunk 原始 24 字节）与 JSON dump，
   格式零改动；
-- load 新增两项校验（§3.1）：计数器域、BucketRef 存在性；
+- **load 收尾必须重建 ID 高水位（S0-4）**：在线 dump 的 counter 快照可能早于
+  chunk 快照（已验证：dump 先读 counter 后扫 chunk、多线程无一致性事务、
+  restore 原样落 counter）——恢复后新写会**复用 rawID 并按同 key 覆盖仍被
+  引用的对象**。修复：load 完成对外可用前，遍历全部 slice 承载段（FSTree/
+  Trash/暂存 holder）求 maxRawID，`nextChunk = max(dumped, maxRawID+1)`。
+  **该缺陷上游单桶同样存在，修复值得独立反哺上游**；
+- **JSON 计数器重建用 rawIDOf（High-6）**：现状 loader 以完整 s.Id 重建
+  高水位（dump.go:445-459），任何 ref>0 的 dump 会把 nextChunk 推到 ≥2^56
+  ——恢复出不可写卷。decode 时先 validateID、以 `rawIDOf(s.Id)` 参与求值；
+- **load 前置预检（原 High-7，降 Medium）**：写入目标库前先校验 dump 的
+  Format/版本/ID 域；老二进制 load 新 dump 会"先写库、丢 Buckets、最后才
+  报版本错"——目标是空库，故后果为可整库清除重试的半成品（非数据损失），
+  运维指引：load 失败即清库重跑，勿在残库上二次操作；
+- load 校验（§3.1）：计数器域、BucketRef 存在性；
 - `Buckets`/`Tiers` 随 Format 整体 dump；脱敏遵守 §3.2。
 
 ### 7.3 回滚（软单向门）
@@ -995,7 +1036,7 @@ meta 备份的有效性坍缩到删除延迟（TrashDays）之内**。运维军�
   注入 / env / 文件）；缺某桶凭证的客户端读该桶文件得 auth 错误——符合
   "宁可失败"原则，也是合法的裁剪部署（只碰热数据的客户端可不配冷桶凭证）；
 - **信封便利模式（保留）**：凭证写入 Format（信封加密）适合小规模部署。
-  诚实评估：`Format.Encrypt` 密钥派生自卷 UUID 且与密文同存（config.go:237），
+  诚实评估：`Format.Encrypt` 密钥派生自卷 UUID 且与密文同存（pkg/meta/config.go:237），
   **防护等级 = 防误看，不防任何能读 Format 的攻击者**；多桶信封 = N 朵云
   凭证同一信封，任一客户端沦陷即全部泄露。生产跨账号部署应使用本地化模式。
 
@@ -1045,6 +1086,33 @@ per-bucket/tier 可观测指标与 `tier status` 收敛度量（§12.4）；rena
 决策（§11.7）；panic → 显式错误（§3.1）；JSON dump id 超 2^53 的外部工具
 精度告警（§7.2 注记）。
 
+### 第三轮（codex 对抗性评审）条款与处置
+
+方向性决策（均已确认并落入正文）：
+
+| # | 发现 | 处置 |
+|---|---|---|
+| S0-1 | bucket_id 可复制、探测非线性化、Format 非 CAS → 别名穿透 + heal 自删 | IdentityUUID 活体一致方案（§3.2）+ Format generation CAS + 提交后回读 + heal 前互异校验（§5.7） |
+| S0-2 | heal 以 size 冒充完好；逻辑/物理长度混淆 | 字节比较正证据删除 + 删除长度比较 bug（§5.7）；"能扫也能删"全额恢复 |
+| S0-3 | compact 拆毁 holder（含 High-1/2/3） | 对象存储持久性假设（§2.2）→ 退役 holder 取消（INV-6 作废）；暂存 holder 硬化：角色 flag + compactChunk 单点豁免 + 专用 pin 批量原语 + 批级短命（INV-5） |
+| S0-5 | session 扫描三盲区，激活无线性化点 | 第二次撤回声明；危害重定性为漂移非损坏；软门强制 + 凭证轮换推荐（§7.1） |
+
+工程条款（本节 + 正文已落）：
+
+| # | 条款 | 落点 |
+|---|---|---|
+| S0-4 | load 收尾重建 maxRawID（上游既有缺陷，值得反哺） | §7.2 |
+| S0-6 | gc 删除候选执行前逐个点查 meta 复核 | §5.7 |
+| High-4 | Job lease 单调 epoch，控制面 mutation 全部 epoch CAS，holder 按 {job,epoch} 隔离 | M-6 / §10 |
+| High-5 | binding capability {ref, atomic backend}；fileWriter placement 随最新 open 刷新；footer/重启序列化持久化 {ref,sc}；compact 由 meta 侧打标 | §4 / §5.1 / §5.6 |
+| High-6 | JSON 计数器重建用 rawIDOf | §7.2 |
+| High-7→Medium | load 前置预检 + 失败清库指引 | §7.2 |
+| High-8 | 统一 key 派生函数内置 validateID 为唯一门 + ref=8 负向测试矩阵 | §3.1 |
+| High-9 | 每 chunk 冲突预算 5 轮 + 退避 + defer 终态 + plan 复用 | §5.4 |
+| High-10 | gateway 建 tmp/part 前解析目标父目录 placement 并显式设置 | §5.1 |
+| Medium-1 | sealed→retired 四项 blocker，tombstone 仅显式豁免 | G-4 |
+| Medium-2 | 代码引用带完整包路径 | 全文约定 |
+
 ## 10. 分期实施
 
 **Phase 0（前置门槛）**：§9 全部 S0 条款的设计细化 + §14 决策确认 →
@@ -1080,7 +1148,9 @@ per-bucket/tier 可观测指标与 `tier status` 收敛度量（§12.4）；rena
    manifest 复制校验 + 按条目替换与引擎原生 ref 约定 + 会话去重映射 +
    StagingHolds 僵尸防护 + Head 抽验（缺失报 BROKEN）；旧对象删除与
    compact 同构（INV-6 已取消）；
-2. **持久 Job 控制面**（H-6）：job id / lease / inode+chunk checkpoint /
+2. **持久 Job 控制面**（H-6 + 第三轮 High-4）：job id / **lease+单调 epoch**
+   （控制面 mutation 全部 epoch CAS，holder 按 {jobID, epoch} 隔离）/
+   inode+chunk checkpoint /
    限速与并发预算 / 进度与失败清单——TB 级跨云迁移的断点与多实例协作
    不能依赖进程内重扫；
 3. `tier set`（op-A/op-B 自动选路，同云同账号走 server-side copy 快路径）
@@ -1088,7 +1158,9 @@ per-bucket/tier 可观测指标与 `tier status` 收敛度量（§12.4）；rena
 4. 冷冻层级前置（Head 检测 → restore → 重试）；
 5. 桶状态机 draining/sealed 执行面（新 open 拒绝、sealed 拒写）；
 6. 测试：迁移 × 写 × compact × clone × gc 交叉、中断注入（F-1~F-9）、
-   同 id 多条目向量、暂存 inode 到期清理与僵尸提交路径。
+   同 id 多条目向量、暂存 holder 到期清理与僵尸提交路径、
+   **TrashDays=0 + gc --compact + swap/headVerify 交错（S0-3 向量）**、
+   **lease epoch 抢占与旧 worker 复活**、热 chunk 重试预算与 defer。
 
 **Phase 3 策略自动化**
 
